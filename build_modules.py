@@ -55,7 +55,14 @@ def build_dataloader_teaching(args, dataset_name, domain, split):
                              num_workers=args.num_workers)
     return data_loader
 
-
+def load_dinov2(dino_repo ='dinov2',model_type="dinov2_vitb14_reg", checkpoint_path="./weights/dinov2_vitb14_reg4_pretrain.pth"):
+    dino = torch.hub.load(dino_repo, model_type,source='local',pretrained=False).cuda()
+    dino.load_state_dict(torch.load(checkpoint_path))
+    from torchvision import transforms
+    transform = transforms.Compose([
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 正则化
+    ])
+    return dino, transform
 def build_model(args, device):
     if args.backbone == 'resnet50':
         backbone = ResNet50MultiScale()
@@ -66,6 +73,12 @@ def build_model(args, device):
     else:
         raise ValueError('Invalid args.backbone name: ' + args.backbone)
     position_encoding = PositionEncodingSine()
+    if args.enable_dino:
+        dino_backbone,dino_transform = load_dinov2()
+    else:
+        dino_backbone = None
+        dino_transform = None
+
     transformer = DeformableTransformer(
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
@@ -76,6 +89,8 @@ def build_model(args, device):
     )
     model = DeformableDETR(
         backbone=backbone,
+        dino_backbone = dino_backbone,
+        dino_transform = dino_transform,
         position_encoding=position_encoding,
         transformer=transformer,
         num_classes=args.num_classes,

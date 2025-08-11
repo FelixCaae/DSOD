@@ -13,7 +13,7 @@ from datasets.coco_style_dataset import DataPreFetcher
 from datasets.coco_eval import CocoEvaluator
 
 from models.criterion import post_process, get_pseudo_labels, get_topk_outputs, SetCriterion
-from utils.distributed_utils import is_main_process
+from utils.distributed_utils import is_main_process,is_dist_avail_and_initialized
 from utils.box_utils import box_cxcywh_to_xyxy, convert_to_xywh
 from collections import defaultdict
 from typing import List
@@ -22,7 +22,7 @@ from datasets.masking import Masking
 from scipy.optimize import linear_sum_assignment
 from utils.box_utils import box_cxcywh_to_xyxy, generalized_box_iou
 from utils import selective_reinitialize
-
+import torch.distributed as dist
 
 def train_one_epoch_standard(model: torch.nn.Module,
                              criterion: torch.nn.Module,
@@ -247,8 +247,13 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                 student_out = student_model(target_teacher_images, target_masks)
             # variance logit
             student_out_var = student_out['logit_all'].var(dim=0)
-            var_total = student_out_var.mean().item()
-            stu_buffer_cost.append(var_total)
+            var_total = student_out_var.mean()#.item()
+            if is_dist_avail_and_initialized():
+                if not isinstance(var_total, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(var_total)}")
+                dist.all_reduce(var_total, op=dist.ReduceOp.SUM)
+                var_total /= dist.get_world_size()
+            stu_buffer_cost.append(var_total.item())
 
             # Store batch data to buffer
             stu_buffer_img.append(target_teacher_images.clone().detach())
@@ -292,24 +297,32 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                 compare_score = np.array(all_score) - np.array(stu_buffer_cost)
                 # print(len(stu_buffer_cost), len(all_score), np.mean(compare_score<0))
                 if np.mean(compare_score < 0) >= 0.5:
-                    res_dict['stu_ori'].append(stu_buffer_cost)
-                    res_dict['stu_now'].append(all_score)
-                    res_dict['update_iter'].append(len(stu_buffer_cost))
 
-                    df = pd.DataFrame(res_dict)
-                    df.to_csv('dynamic_update.csv')
+                    if is_main_process():
+                        res_dict['stu_ori'].append(stu_buffer_cost)
+                        res_dict['stu_now'].append(all_score)
+                        res_dict['update_iter'].append(len(stu_buffer_cost))
 
+                        df = pd.DataFrame(res_dict)
+                        df.to_csv('dynamic_update.csv')
+
+                    # 全局更新教师模型
                     with torch.no_grad():
-                        state_dict, student_state_dict = teacher_model.state_dict(), student_model.state_dict()
-                        for key, value in state_dict.items():
-                            state_dict[key] = alpha_ema * value + (1 - alpha_ema) * student_state_dict[key].detach()
+                    # 主进程计算新状态字典
+                        state_dict = {}
+                        teacher_state_dict = teacher_model.state_dict()
+                        student_state_dict = student_model.state_dict()
+                        for key in teacher_state_dict.keys():
+                            state_dict[key] = alpha_ema * teacher_state_dict[key] + (1 - alpha_ema) * student_state_dict[key].detach()
+                        # 所有GPU加载相同的状态
                         teacher_model.load_state_dict(state_dict)
-
-                    # Clear buffer
+                        # Clear buffer
                     stu_buffer_cost = []
                     stu_buffer_img = []
                     stu_buffer_mask = []
+                # print('update')
             else:
+                # print('reinitialize')
                 # print(len(stu_buffer_cost), 'Load previous student model weight')
                 with torch.no_grad():
                     student_model = selective_reinitialize(student_model, init_student_model.state_dict(), keep_modules)
@@ -444,7 +457,12 @@ def eval_stu(student_model: torch.nn.Module,
             student_out = student_model(stu_buffer_img[i], stu_buffer_mask[i])
 
             student_out_var = student_out['logit_all'].var(dim=0)
-            var_total = student_out_var.mean().item()
-            all_score.append(var_total)
+            var_total = student_out_var.mean()
+            if is_dist_avail_and_initialized():
+                if not isinstance(var_total, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(var_total)}")
+                dist.all_reduce(var_total, op=dist.ReduceOp.SUM)
+                var_total /= dist.get_world_size()
+            all_score.append(var_total.item())
 
     return all_score

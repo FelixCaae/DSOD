@@ -10,12 +10,13 @@ from torch.nn.parallel import DistributedDataParallel
 from engine import *
 from build_modules import *
 from datasets.augmentations import train_trans, val_trans, strong_trans
-from utils import get_rank, init_distributed_mode, resume_and_load, save_ckpt, selective_reinitialize
+from utils import get_rank, init_distributed_mode, resume_and_load, save_ckpt, selective_reinitialize, is_main_process
 
 
 def get_args_parser(parser):
     # Model Settings
     parser.add_argument('--backbone', default='resnet50', type=str)
+    parser.add_argument('--enable_dino', action='store_true')
     parser.add_argument('--pos_encoding', default='sine', type=str)
     parser.add_argument('--num_classes', default=9, type=int)
     parser.add_argument('--num_queries', default=300, type=int)
@@ -119,7 +120,9 @@ def single_domain_training(model, device):
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.epoch_lr_drop)
     # Record the best mAP
     ap50_best = -1.0
+    saturate_epoch = 10
     for epoch in range(args.epoch):
+
         # Set the epoch for the sampler
         if args.distributed and hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
@@ -198,8 +201,19 @@ def teaching(model_stu, device):
 
     # Initialize masking
     masking = Masking(block_size=args.block_size, masked_ratio=args.masked_ratio)
-
+    saturate_epoch = 10
     for epoch in range(args.epoch):
+        import math
+        i0 = min(epoch+1, saturate_epoch)
+        i1 = min(epoch, saturate_epoch)
+        dino_factor_stu = math.sin(i0/saturate_epoch * math.pi / 2) * 0.5
+        dino_factor_tch = math.sin(i1/saturate_epoch * math.pi / 2) * 0.5
+        if args.distributed:
+            model_stu.module.dino_factor = dino_factor_stu
+            model_tch.module.dino_factor = dino_factor_tch
+        else:
+            model_stu.dino_factor = dino_factor_stu
+            model_tch.module.dino_factor = dino_factor_tch
         # Set the epoch for the sampler
         if args.distributed and hasattr(target_loader.sampler, 'set_epoch'):
             target_loader.sampler.set_epoch(epoch)
@@ -256,7 +270,8 @@ def teaching(model_stu, device):
         # criterion.clear_positive_logits()
 
         # Write the losses to tensorboard
-        write_loss(epoch, 'teaching_target', loss_train, loss_target_dict)
+        if is_main_process():
+            write_loss(epoch, 'teaching_target', loss_train, loss_target_dict)
         lr_scheduler.step()
 
         # Evaluate teacher and student model
@@ -276,20 +291,23 @@ def teaching(model_stu, device):
             print_freq=args.print_freq,
             flush=args.flush
         )
-        # Save the best checkpoint
-        map50_tch = np.asarray([ap for ap in ap50_per_class_teacher if ap > -0.001]).mean().tolist()
-        map50_stu = np.asarray([ap for ap in ap50_per_class_student if ap > -0.001]).mean().tolist()
-        write_ap50(epoch, 'teaching_teacher', map50_tch, ap50_per_class_teacher, idx_to_class)
-        write_ap50(epoch, 'teaching_student', map50_stu, ap50_per_class_student, idx_to_class)
-        # if max(map50_tch, map50_stu) > ap50_best:
-        #     ap50_best = max(map50_tch, map50_stu)
-        #     save_ckpt(model_tch if map50_tch > map50_stu else model_stu, output_dir/'model_best.pth', args.distributed)
-        if map50_tch > ap50_best:
-            ap50_best = map50_tch
-            save_ckpt(model_tch, output_dir/'model_best.pth', args.distributed)
-        if epoch == args.epoch - 1:
-            save_ckpt(model_tch, output_dir/'model_last_tch.pth', args.distributed)
-            save_ckpt(model_stu, output_dir/'model_last_stu.pth', args.distributed)
+        if is_main_process():
+            # Save the best checkpoint
+            map50_tch = np.asarray([ap for ap in ap50_per_class_teacher if ap > -0.001]).mean().tolist()
+            map50_stu = np.asarray([ap for ap in ap50_per_class_student if ap > -0.001]).mean().tolist()
+            print('eval teacher')
+            write_ap50(epoch, 'teaching_teacher', map50_tch, ap50_per_class_teacher, idx_to_class)
+            print('eval stdent')
+            write_ap50(epoch, 'teaching_student', map50_stu, ap50_per_class_student, idx_to_class)
+            # if max(map50_tch, map50_stu) > ap50_best:
+            #     ap50_best = max(map50_tch, map50_stu)
+            #     save_ckpt(model_tch if map50_tch > map50_stu else model_stu, output_dir/'model_best.pth', args.distributed)
+            if map50_tch > ap50_best:
+                ap50_best = map50_tch
+                save_ckpt(model_tch, output_dir/'model_best.pth', args.distributed)
+            if epoch == args.epoch - 1:
+                save_ckpt(model_tch, output_dir/'model_last_tch.pth', args.distributed)
+                save_ckpt(model_stu, output_dir/'model_last_stu.pth', args.distributed)
         # if (epoch+1) % 5 == 0:
         #     save_ckpt(model_tch, output_dir/f'tch_epoch{epoch:02}.pth', args.distributed)
         #     save_ckpt(model_stu, output_dir/f'stu_epoch{epoch:02}.pth', args.distributed)

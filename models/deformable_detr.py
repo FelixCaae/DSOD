@@ -28,6 +28,8 @@ class DeformableDETR(nn.Module):
                  backbone,
                  position_encoding,
                  transformer,
+                 dino_backbone=None,
+                 dino_transform=None,
                  num_classes=9,
                  num_queries=300,
                  num_feature_levels=4):
@@ -53,6 +55,67 @@ class DeformableDETR(nn.Module):
         self._init_params()
         self.class_embed = nn.ModuleList([self.class_embed for _ in range(transformer.decoder.num_layers)])
         self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(transformer.decoder.num_layers)])
+        self.dino_backbone = dino_backbone
+        if dino_backbone is not None:
+            for param in dino_backbone.parameters():
+                param.requires_grad = False
+            self.fuse_type = 'add'
+            self.proj= nn.Conv2d(768, 1024, kernel_size=1)
+            self.dino_transform = dino_transform
+            self.dino_factor = 1
+    @torch.no_grad()
+    def forward_dino(self, data, output_shape=None, keyword='image_weak', max_length=560, patch_size=14,):
+        #data is an image tensor [B,C,H,W] 
+        transforms = self.dino_transform
+        model_dino = self.dino_backbone
+        assert max_length % patch_size == 0
+        import torch.nn.functional as F
+        output = []
+        h,w = data.shape[2:4]
+        x = data
+        if h <= w:
+            s_w = max_length
+            s_h = s_w * (h/w)
+            s_h = (s_h // patch_size) * patch_size
+        else:
+            s_h = max_length
+            s_w = s_h * (w/h)
+            s_w = (s_w // patch_size) * patch_size
+        s_h, s_w = int(s_h), int(s_w)
+        x = F.interpolate(x, (s_h, s_w), mode='bilinear')
+        feat = model_dino.forward_features(x)
+        feat = feat['x_norm_patchtokens'].reshape(1, s_h//patch_size, s_w//patch_size,-1).permute(0,3,1,2)
+        if output_shape is None:
+            output_shape = s_h//patch_size, s_w//patch_size
+        feat = F.interpolate(feat, output_shape, mode='bilinear')   
+        return feat
+
+    def fuse(self, features_cnn, features_dino, target_layer=1):
+        if self.fuse_type == 'add':
+            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(features_dino) * self.dino_factor
+        elif self.fuse_type == 'cat':
+            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(torch.cat([features_dino,features_cnn[target_layer]], dim=1)) * self.dino_factor
+        elif self.fuse_type == 'norm_add':
+            features_cnn[target_layer] = features_cnn[target_layer]/features_cnn[target_layer].std()
+            features_dino = features_dino/features_dino.norm()
+            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(features_dino) * self.dino_factor
+
+        elif self.fuse_type == 'se_attn':
+            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(self.se_block(features_dino)) * self.dino_factor
+        elif self.fuse_type == 'attn':
+            B,C,H,W = features_cnn[target_layer].shape
+            dino_feats_proj = self.proj(features_dino)
+            query = features_cnn[target_layer].flatten(2).permute(2,0,1) #B,C,H,W -> HW,B,C
+            key = value = dino_feats_proj.flatten(2).permute(2,0,1)
+            attn_out = self.fuse_attn(query, key, value)[0]
+            attn_out = self.fuse_mlp(attn_out)
+            # import pdb;pdb.set_trace()
+            attn_out = self.fuse_ln(value + attn_out)
+            attn_out = attn_out.permute(1,2,0).view(B,C,H,W)
+            features_cnn[target_layer] = features_cnn[target_layer] + attn_out * self.dino_factor
+        else:
+            raise  NotImplementedError
+        return features_cnn
 
     def _build_input_projections(self):
         input_proj_list = []
@@ -97,6 +160,10 @@ class DeformableDETR(nn.Module):
     def forward(self, images, masks):
         # Backbone forward
         features = self.backbone(images)
+        if self.dino_backbone is not None:
+            target_layer = 1
+            dino_features = self.forward_dino(images, output_shape=features[target_layer].shape[2:])
+            features = self.fuse(features, dino_features, target_layer=target_layer)
         # Prepare input features for transformer
         src_list, mask_list = [], []
         for i, feature in enumerate(features):

@@ -60,6 +60,7 @@ class CocoStyleDataset(CocoDetection):
         # dataset_root = os.path.join(root_dir, dataset_name)
         img_dir = os.path.join(root_dir, self.img_dirs[dataset_name][split])
         self.anno_file = os.path.join(root_dir, self.anno_files[dataset_name][domain][split])
+        
         super(CocoStyleDataset, self).__init__(root=img_dir, annFile=self.anno_file, transforms=transforms)
         self.split = split
 
