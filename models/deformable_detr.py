@@ -20,6 +20,41 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+class SEAttention(nn.Module):
+    def __init__(self, channels, reduction_ratio=16):
+        super(SEAttention, self).__init__()
+        self.reduction = channels // reduction_ratio
+        self.channels = channels
+        
+        # Squeeze-and-Excitation
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # [B, C, 1, 1]
+            nn.Conv2d(channels, self.reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.reduction, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, y):
+        se_weight = self.se(x)  # [B, C, 1, 1]
+        return y * se_weight.expand_as(y)  # 通道权重
+class SPAttention(nn.Module):
+    def __init__(self, channels, reduction_ratio=16):
+        super(SPAttention, self).__init__()
+        self.reduction = channels // reduction_ratio
+        self.channels = channels
+        
+        # Squeeze-and-Excitation
+        self.sp = nn.Sequential(
+            nn.Conv2d(channels, self.reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.reduction, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, y):
+        sp_weight = self.sp(x)  # [B, 1, H, W]
+        return y * sp_weight.expand_as(y)  # 通道权重
 
 
 class DeformableDETR(nn.Module):
@@ -30,6 +65,7 @@ class DeformableDETR(nn.Module):
                  transformer,
                  dino_backbone=None,
                  dino_transform=None,
+                 fuse_type = 'add',
                  num_classes=9,
                  num_queries=300,
                  num_feature_levels=4):
@@ -59,10 +95,18 @@ class DeformableDETR(nn.Module):
         if dino_backbone is not None:
             for param in dino_backbone.parameters():
                 param.requires_grad = False
-            self.fuse_type = 'add'
-            self.proj= nn.Conv2d(768, 1024, kernel_size=1)
+            self.fuse_type = fuse_type
+            out_channels = [512,1024,2048]
+            self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
+            # self.fuse_blocks = nn.ModuleList
+            if self.fuse_type == 'se':
+                self.se_blocks = nn.ModuleList([SEAttention(i) for i in out_channels])
+            elif self.fuse_type == 'sp':
+                self.sp_blocks = nn.ModuleList([SPAttention(i) for i in out_channels])
+
             self.dino_transform = dino_transform
-            self.dino_factor = 1
+            # self.dino_factor = nn.Parameter(torch.tensor(0.01))
+            self.dino_factor = 0.01
     @torch.no_grad()
     def forward_dino(self, data, output_shape=None, keyword='image_weak', max_length=560, patch_size=14,):
         #data is an image tensor [B,C,H,W] 
@@ -91,17 +135,27 @@ class DeformableDETR(nn.Module):
         return feat
 
     def fuse(self, features_cnn, features_dino, target_layer=1):
+        import torch.nn.functional as F
+        dino_feats = []
         if self.fuse_type == 'add':
-            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(features_dino) * self.dino_factor
-        elif self.fuse_type == 'cat':
-            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(torch.cat([features_dino,features_cnn[target_layer]], dim=1)) * self.dino_factor
-        elif self.fuse_type == 'norm_add':
-            features_cnn[target_layer] = features_cnn[target_layer]/features_cnn[target_layer].std()
-            features_dino = features_dino/features_dino.norm()
-            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(features_dino) * self.dino_factor
+            for target_layer in range(3):
+                #blending
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor
+                dino_feats.append(dino_proj_feats)
+        elif self.fuse_type == 'se':
+            for target_layer in range(3):
+                #blending
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                dino_proj_feats = self.se_blocks[target_layer](features_cnn[target_layer], dino_proj_feats)
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor    
+        elif self.fuse_type == 'sp':
+            for target_layer in range(3):
+                #blending
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                dino_proj_feats = self.sp_blocks[target_layer](features_cnn[target_layer], dino_proj_feats)
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor    
 
-        elif self.fuse_type == 'se_attn':
-            features_cnn[target_layer] = features_cnn[target_layer] + self.proj(self.se_block(features_dino)) * self.dino_factor
         elif self.fuse_type == 'attn':
             B,C,H,W = features_cnn[target_layer].shape
             dino_feats_proj = self.proj(features_dino)

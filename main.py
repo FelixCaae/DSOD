@@ -16,7 +16,10 @@ from utils import get_rank, init_distributed_mode, resume_and_load, save_ckpt, s
 def get_args_parser(parser):
     # Model Settings
     parser.add_argument('--backbone', default='resnet50', type=str)
+    ##
     parser.add_argument('--enable_dino', action='store_true')
+    parser.add_argument('--fuse_type', default='add')
+    ##
     parser.add_argument('--pos_encoding', default='sine', type=str)
     parser.add_argument('--num_classes', default=9, type=int)
     parser.add_argument('--num_queries', default=300, type=int)
@@ -204,7 +207,7 @@ def teaching(model_stu, device):
     saturate_epoch = 10
     for epoch in range(args.epoch):
         import math
-        i0 = min(epoch+1, saturate_epoch)
+        i0 = min(epoch, saturate_epoch)
         i1 = min(epoch, saturate_epoch)
         dino_factor_stu = math.sin(i0/saturate_epoch * math.pi / 2) * 0.5
         dino_factor_tch = math.sin(i1/saturate_epoch * math.pi / 2) * 0.5
@@ -293,6 +296,7 @@ def teaching(model_stu, device):
         )
         if is_main_process():
             # Save the best checkpoint
+            print('dino factor', model_stu.module.dino_factor)
             map50_tch = np.asarray([ap for ap in ap50_per_class_teacher if ap > -0.001]).mean().tolist()
             map50_stu = np.asarray([ap for ap in ap50_per_class_student if ap > -0.001]).mean().tolist()
             print('eval teacher')

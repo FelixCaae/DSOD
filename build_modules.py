@@ -95,7 +95,8 @@ def build_model(args, device):
         transformer=transformer,
         num_classes=args.num_classes,
         num_queries=args.num_queries,
-        num_feature_levels=args.num_feature_levels
+        num_feature_levels=args.num_feature_levels,
+        fuse_type= args.fuse_type
     )
     model.to(device)
     return model
