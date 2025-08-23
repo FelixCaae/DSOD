@@ -85,7 +85,7 @@ def get_args_parser(parser):
     parser.add_argument('--print_freq', default=100, type=int)
     parser.add_argument('--flush', default=True, type=bool)
     parser.add_argument("--resume", default="", type=str)
-
+    parser.add_argument("--tag", default="", type=str)
 
 def set_random_seed(seed):
     random.seed(seed)
@@ -167,6 +167,72 @@ def single_domain_training(model, device):
     print('Single-domain training finished. Time cost: ' + total_time_str +
           ' . Best mAP50: ' + str(ap50_best), flush=args.flush)
 
+def vis_model(model, samples, prefix=""):
+    import os
+    import torch
+    from detectron2.structures import Instances
+    from detectron2.utils.visualizer import Visualizer
+    from detectron2.data import MetadataCatalog,Metadata
+
+    save_dir = 'vis_output'
+    os.makedirs(save_dir, exist_ok=True)    
+    metadata = MetadataCatalog.get("cityscape_2007_train_s")  # 注意：Cityscapes的注册名是"cityscapes"（小写）
+ # ImageNet归一化参数
+    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+    metadata  = Metadata(thing_classes=['bg', 'person', 'car', 'train', 'rider', 'truck', 'motorcycle', 'bicycle', 'bus'])
+    for idx, (target_teacher_images, target_masks) in enumerate(samples):
+        with torch.no_grad():
+            student_out = model(target_teacher_images, target_masks)
+            
+            # 获取图像尺寸（假设输入是 [B, C, H, W]）
+            height, width = target_teacher_images.shape[-2:]
+            instances = Instances(image_size=(height, width))
+            # 提取预测框、类别和置信度
+            pred_boxes = student_out["boxes_all"][-1,0].cpu() * torch.tensor([[width,height,width,height]])  # [N, 4]
+            #convert from cxcywh to xyxy
+            pred_boxes = torch.cat([pred_boxes[:,:2] - pred_boxes[:,2:]/2,  pred_boxes[:,:2] + pred_boxes[:,2:]/2], dim=1) 
+            pred_logits = student_out["logit_all"][-1,0].sigmoid().cpu()  # [N, num_classes]
+            pred_scores, pred_classes = pred_logits.max(dim=-1)  # [N], [N]
+            # 填充Instances对象
+            instances.pred_boxes = pred_boxes[pred_scores>0.3]
+            instances.scores = pred_scores[pred_scores>0.3]
+            instances.pred_classes = pred_classes[pred_scores>0.3]
+            # 可视化（假设图像是 [0,1] 归一化的）
+            image_np = target_teacher_images[0].cpu().numpy()  # [C, H, W]
+            image_np = np.transpose(image_np, (1, 2, 0))  # -> [H, W, C]
+            image_np = image_np * IMAGENET_STD.numpy() + IMAGENET_MEAN.numpy()  # 反归一化
+            image_np = np.clip(image_np * 255, 0, 255).astype("uint8")
+            
+            #这块反归一化有点问题，因为图片是根据Image Net pretrain参数归一化的 
+            vis = Visualizer(image_np, metadata=metadata, scale=1.0)
+
+            vis_output = vis.draw_instance_predictions(instances.to(torch.device('cpu')))
+            
+            # 保存结果
+            output_path = os.path.join(save_dir, f"{prefix}_pred_{idx}.png")
+            vis_output.save(output_path)
+
+def sample_random_samples(dataloader, device, sample_num=10):
+    target_fetcher = DataPreFetcher(dataloader,  device=device)
+    samples = []
+    i = 0
+    sample_idx = np.random.choice(np.arange(len(dataloader)), sample_num, replace=False)
+    for i in range(len(dataloader)):
+        if i not in sample_idx:
+            continue
+        images, masks, _  = target_fetcher.next()
+        samples.append([images[1], masks])
+    return samples
+
+def js_divergence(p, q, eps=1e-10):
+    from scipy.stats import entropy
+    p = p.cpu().numpy()
+    q = q.cpu().numpy()
+    p = np.clip(p, eps, 1.0)  # 避免log(0)
+    q = np.clip(q, eps, 1.0)
+    m = 0.5 * (p + q)
+    return 0.5 * (entropy(p, m, axis=-1) + entropy(q, m, axis=-1)).mean()
 
 # Teaching
 def teaching(model_stu, device):
@@ -204,19 +270,8 @@ def teaching(model_stu, device):
 
     # Initialize masking
     masking = Masking(block_size=args.block_size, masked_ratio=args.masked_ratio)
-    saturate_epoch = 10
+    test_samples = sample_random_samples(target_loader, device)
     for epoch in range(args.epoch):
-        import math
-        i0 = min(epoch, saturate_epoch)
-        i1 = min(epoch, saturate_epoch)
-        dino_factor_stu = math.sin(i0/saturate_epoch * math.pi / 2) * 0.5
-        dino_factor_tch = math.sin(i1/saturate_epoch * math.pi / 2) * 0.5
-        if args.distributed:
-            model_stu.module.dino_factor = dino_factor_stu
-            model_tch.module.dino_factor = dino_factor_tch
-        else:
-            model_stu.dino_factor = dino_factor_stu
-            model_tch.module.dino_factor = dino_factor_tch
         # Set the epoch for the sampler
         if args.distributed and hasattr(target_loader.sampler, 'set_epoch'):
             target_loader.sampler.set_epoch(epoch)
@@ -264,6 +319,7 @@ def teaching(model_stu, device):
                 print_freq=args.print_freq,
                 flush=args.flush,
                 fix_update_iter=args.fix_update_iter,
+                test_samples = test_samples, 
             )
         else:
             raise ValueError('Invalid mode: ' + args.mode)
@@ -296,7 +352,6 @@ def teaching(model_stu, device):
         )
         if is_main_process():
             # Save the best checkpoint
-            print('dino factor', model_stu.module.dino_factor)
             map50_tch = np.asarray([ap for ap in ap50_per_class_teacher if ap > -0.001]).mean().tolist()
             map50_stu = np.asarray([ap for ap in ap50_per_class_student if ap > -0.001]).mean().tolist()
             print('eval teacher')
@@ -318,7 +373,6 @@ def teaching(model_stu, device):
     end_time = time.time()
     total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
     print('Teaching finished. Time cost: ' + total_time_str + ' . Best mAP50: ' + str(ap50_best), flush=args.flush)
-
 
 # Evaluate only
 def eval_only(model, device):
@@ -368,6 +422,8 @@ def main():
         single_domain_training(model, device)
     elif args.mode == "teaching_standard" or args.mode == "teaching_mask":
         teaching(model, device)
+    elif args.mode == 'teaching_coadaptation':
+        teaching_coadaptation(model, device)
     elif args.mode == "eval":
         eval_only(model, device)
     else:
@@ -380,7 +436,10 @@ if __name__ == '__main__':
     get_args_parser(parser_main)
     args = parser_main.parse_args()
     # Set output directory
-    output_dir = Path(args.output_dir)
+    if args.tag != "":
+        output_dir = os.path.join(args.output_dir, args.tag)
+    else:
+        output_dir = Path(args.output_dir)
     logs_dir = output_dir/'data_logs'
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     Path(logs_dir).mkdir(parents=True, exist_ok=True)

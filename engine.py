@@ -23,7 +23,49 @@ from scipy.optimize import linear_sum_assignment
 from utils.box_utils import box_cxcywh_to_xyxy, generalized_box_iou
 from utils import selective_reinitialize
 import torch.distributed as dist
+def infer_model(model, samples):
+    out_list = []
+    for target_teacher_images,target_masks in samples:
+        with torch.no_grad():
+            student_out = model(target_teacher_images, target_masks)
+        # variance logit
+        student_out = student_out['logit_all'][-1]
+        out_list.append(student_out)
+    return torch.stack(out_list, dim=0)
+def dynamic_update_weight(model, samples, conf_thresh=0.1, stability_thresh=0.95, update_step=0.02):
+    if hasattr(model, 'dino_factor'):
+        # init_weight_factor = model.dino_factor
+        model_strip = model
+    else:
+        model_strip = model.module
+    #get init prediction
+    # model_strip.dino_factor = 1.0
+    # vis_model(model, samples, prefix = '1.0')
+    init_weight_factor = model_strip.dino_factor
+    eps = 1e-6
+    #set reference dino weight
+    model_strip.dino_factor = 0
+    out_init = infer_model(model, samples)[:, 0, :, 1:].sigmoid() #N_img, N_query, N_class
+    #set test dino weight
+    model_strip.dino_factor = init_weight_factor 
+    new_out = infer_model(model, samples)[:, 0, :, 1:].sigmoid()
+    #compute class consistency
+    init_score, init_cls = out_init.max(dim=-1)
+    new_score, new_cls = new_out.max(dim=-1)
+    fg_mask = (init_score > conf_thresh) & (new_score > conf_thresh) 
+    consist_pred = (init_cls[fg_mask]==new_cls[fg_mask]).sum() / (fg_mask.sum() + eps)
+    if is_dist_avail_and_initialized():
+        dist.all_reduce(consist_pred, op=dist.ReduceOp.SUM)
+        consist_pred = consist_pred/dist.get_world_size()
+    #compute top confidence
+    if consist_pred > stability_thresh:
+        model_strip.dino_factor = init_weight_factor + update_step
+    else:
+        model_strip.dino_factor = init_weight_factor - update_step
 
+        # model_strip.dino_step = model_strip.dino_step / 2
+    print(f"consist pred {float(consist_pred)} dino factor {float(model_strip.dino_factor)} dino step {float(model_strip.dino_step)}")
+    return 
 def train_one_epoch_standard(model: torch.nn.Module,
                              criterion: torch.nn.Module,
                              data_loader: DataLoader,
@@ -32,6 +74,7 @@ def train_one_epoch_standard(model: torch.nn.Module,
                              epoch: int,
                              clip_max_norm: float = 0.0,
                              print_freq: int = 20,
+                             start_iter = 0,
                              flush: bool = True):
     """
     Train the standard detection model, using only labelled training set source.
@@ -76,6 +119,7 @@ def train_one_epoch_standard(model: torch.nn.Module,
     return epoch_loss, epoch_loss_dict
 
 
+
 def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                                       teacher_model: torch.nn.Module,
                                       criterion_pseudo: torch.nn.Module,
@@ -88,7 +132,9 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                                       clip_max_norm: float = 0.0,
                                       print_freq: int = 20,
                                       flush: bool = True,
-                                      fix_update_iter: int = 1):
+                                      fix_update_iter: int = 1,
+                                      test_samples = []
+                                      ):
     """
     Train the student model with the teacher model, using only unlabeled training set target .
     """
@@ -108,6 +154,19 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
 
     for iter in range(total_iters):
         # Target teacher forward
+        # progressive updating weight factor
+        # alpha = 0.
+        import math
+        if iter % 100 == 0:
+            print('dynamic updating teacher dino weight')
+            # dynamic_update_weight(teacher_model, test_samples)
+                    # if hasattr(student_model, 'module'):
+            teacher_model.module.dino_factor =   math.sin(epoch/10* math.pi/2) * 0.5
+            student_model.module.dino_factor = teacher_model.module.dino_factor
+            if is_main_process():
+                print('tch dino factor', teacher_model.module.dino_factor)
+                print('stu dino factor', student_model.module.dino_factor)
+
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
@@ -206,6 +265,13 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
     total_iters = len(target_loader)
 
     for iter in range(total_iters):
+        # Target teacher forward
+        # progressive updating weight factor
+    
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+
         # Target teacher forward
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)

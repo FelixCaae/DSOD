@@ -7,6 +7,7 @@ OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26503 \
 --nproc_per_node=${N_GPUS} \
 main.py \
+--enable_dino \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \

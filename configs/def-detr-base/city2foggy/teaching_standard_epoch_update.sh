@@ -1,10 +1,10 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_mask_1
+OUTPUT_DIR=./city2foggy/teaching_standard_epoch_update
 
-OMP_NUM_THREADS=4 torchrun \
---rdzv_endpoint localhost:26503 \
+ OMP_NUM_THREADS=4 torchrun \
+--rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
 main.py \
 --backbone resnet50 \
@@ -23,11 +23,8 @@ main.py \
 --alpha_ema 0.999 \
 --epoch 30 \
 --epoch_lr_drop 80 \
---mode teaching_mask \
---threshold 0.3 \
---dynamic_update \
---max_update_iter 5 \
---only_class_loss \
---use_pseudo_label_weights \
+--mode teaching_standard \
+--threshold 0.5 \
+--fix_update_iter 1000 \
 --output_dir ${OUTPUT_DIR} \
---resume ./city2foggy_source_only_29_53.pth
+--resume city2foggy_source_only_29_53.pth

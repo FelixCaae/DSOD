@@ -1,12 +1,14 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_mask_1
+OUTPUT_DIR=./city2foggy/teaching_mask_attn
 
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26503 \
 --nproc_per_node=${N_GPUS} \
 main.py \
+--fuse_type se \
+--enable_dino \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \

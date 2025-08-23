@@ -1,12 +1,14 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_mask_1
+OUTPUT_DIR=./city2foggy/teaching_standard_dino
 
-OMP_NUM_THREADS=4 torchrun \
---rdzv_endpoint localhost:26503 \
+ OMP_NUM_THREADS=4 torchrun \
+--rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
 main.py \
+--fuse_type add \
+--enable_dino \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
@@ -21,13 +23,11 @@ main.py \
 --lr_backbone 2e-5 \
 --lr_linear_proj 2e-5 \
 --alpha_ema 0.999 \
---epoch 30 \
+--epoch 10 \
 --epoch_lr_drop 80 \
---mode teaching_mask \
+--mode teaching_standard \
 --threshold 0.3 \
---dynamic_update \
---max_update_iter 5 \
---only_class_loss \
---use_pseudo_label_weights \
+--fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
---resume ./city2foggy_source_only_29_53.pth
+--resume city2foggy_source_only_29_53.pth
+--tag test_dynamic_weight

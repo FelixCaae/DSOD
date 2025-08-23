@@ -20,6 +20,25 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+
+class ConvBlock(nn.Module):
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(
+            nn.Conv2d(n, k, kernel_size = 1) for n, k in zip([input_dim] + h, h + [output_dim])
+        )
+
+    def forward(self, x):
+        x_in = x
+        for i, layer in enumerate(self.layers):
+            x = relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        x_out = x + x_in
+        return x_out
+
+
 class SEAttention(nn.Module):
     def __init__(self, channels, reduction_ratio=16):
         super(SEAttention, self).__init__()
@@ -92,21 +111,25 @@ class DeformableDETR(nn.Module):
         self.class_embed = nn.ModuleList([self.class_embed for _ in range(transformer.decoder.num_layers)])
         self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(transformer.decoder.num_layers)])
         self.dino_backbone = dino_backbone
+        # self.learnable_weight = nn.Parameter(torch.tensor(0.))
         if dino_backbone is not None:
             for param in dino_backbone.parameters():
                 param.requires_grad = False
             self.fuse_type = fuse_type
             out_channels = [512,1024,2048]
             self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
-            # self.fuse_blocks = nn.ModuleList
+            #enable fuse blocks for post-fusion
             if self.fuse_type == 'se':
                 self.se_blocks = nn.ModuleList([SEAttention(i) for i in out_channels])
             elif self.fuse_type == 'sp':
                 self.sp_blocks = nn.ModuleList([SPAttention(i) for i in out_channels])
+            elif self.fuse_type == 'blending':
+                self.fuse_blocks = nn.ModuleList([ConvBlock(i, 1024, i, 2) for i in out_channels])
 
             self.dino_transform = dino_transform
             # self.dino_factor = nn.Parameter(torch.tensor(0.01))
             self.dino_factor = 0.01
+            self.dino_step = 0.01
     @torch.no_grad()
     def forward_dino(self, data, output_shape=None, keyword='image_weak', max_length=560, patch_size=14,):
         #data is an image tensor [B,C,H,W] 
@@ -141,7 +164,15 @@ class DeformableDETR(nn.Module):
             for target_layer in range(3):
                 #blending
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor #* torch.exp(self.learnable_weight)
+                dino_feats.append(dino_proj_feats)
+        elif self.fuse_type == 'blending':
+            for target_layer in range(3):
+                #blending
+                # self.projs[target_layer]
+                # import pdb;pdb.set_trace()
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * torch.exp(self.learnable_weight)
                 dino_feats.append(dino_proj_feats)
         elif self.fuse_type == 'se':
             for target_layer in range(3):
@@ -256,6 +287,7 @@ class DeformableDETR(nn.Module):
         out = {
             'logit_all': outputs_class,
             'boxes_all': outputs_coord,
-            'features': features[-1].detach()
+            'features': features[-1].detach(),
+            # 'dino_features':dino_features
         }
         return out

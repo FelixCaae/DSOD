@@ -1,9 +1,9 @@
-N_GPUS=1
+N_GPUS=8
 BATCH_SIZE=8
-DATA_ROOT=./data
-OUTPUT_DIR=./outputs/def-detr-base/city2foggy/teaching_standard
+DATA_ROOT=./dataset
+OUTPUT_DIR=./city2foggy/teaching_standard_tr05
 
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 torchrun \
+ OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
 main.py \
@@ -24,7 +24,7 @@ main.py \
 --epoch 30 \
 --epoch_lr_drop 80 \
 --mode teaching_standard \
---threshold 0.3 \
+--threshold 0.5 \
 --fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
---resume ${OUTPUT_DIR}/../source_only/city2foggy_source_only_29_53.pth
+--resume city2foggy_source_only_29_53.pth
