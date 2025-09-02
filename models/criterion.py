@@ -98,6 +98,7 @@ class HungarianMatcher(nn.Module):
             indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
             return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
+import torch.nn.functional as  F
 
 class SetCriterion(nn.Module):
 
@@ -328,8 +329,26 @@ class SetCriterion(nn.Module):
 
         # Calculate average for all decoder layers
         loss /= num_decoder_layers
-        for k, v in loss_dict.items():
-            loss_dict[k] /= num_decoder_layers
+        # for k, v in loss_dict.items():
+        #     loss_dict[k] /= num_decoder_layers
+        # feature_alignment_loss = F.mse_loss(out['features'][-1], out['dino_features'][-1], reduction='mean') + F.mse_loss(out['features'][-2], out['dino_features'][-2], reduction='mean') + F.mse_loss(out['features'][-3], out['dino_features'][-3], reduction='mean')
+        # loss_dict['feature_alignment_loss'] = feature_alignment_loss.detach()
+        # loss += feature_alignment_loss 
+
+        enable_dino_alignment = False
+        if enable_dino_alignment:
+            query_embed = out['query_embed'][0]
+            #Given boxes_all[-1] as box input (x,y,w,h) mode, 0-1 normalzied  . Size [BS,Len_Query, 4]
+            boxes = box_cxcywh_to_xyxy(boxes_all[0])[0] # take bs = 1 as default
+            b,c,h,w = out['dino_features'].shape
+            rois = boxes * torch.tensor([[w,h,w,h]]).cuda()
+            from torchvision.ops import roi_align
+            rois = torch.cat([torch.zeros(len(rois), 1).cuda(), rois],  dim=1)
+            roi_features = roi_align(out['dino_features'], rois, output_size=(1, 1))
+            #Compute ROI features from DINO feature Size [BS, Channel, H, W] 
+            loss_dict['query_alignment_loss'] = F.mse_loss(query_embed[0], roi_features.flatten(1), reduction='mean') 
+            loss += loss_dict['query_alignment_loss'] * 0
+            loss_dict['dino_feats_proj_norm'] = out['dino_features_proj'][-1].norm(dim=1,p=2).mean()
         return loss, loss_dict
 
 

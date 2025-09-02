@@ -1,9 +1,8 @@
-N_GPUS=1
+N_GPUS=8
 BATCH_SIZE=8
-DATA_ROOT=./data
+DATA_ROOT=./dataset
 OUTPUT_DIR=./outputs/def-detr-base/sim2city/teaching_standard
-
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 torchrun \
+OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26504 \
 --nproc_per_node=${N_GPUS} \
 main.py \
@@ -21,10 +20,10 @@ main.py \
 --lr_backbone 2e-5 \
 --lr_linear_proj 2e-5 \
 --alpha_ema 0.999 \
---epoch 30 \
+--epoch 10 \
 --epoch_lr_drop 80 \
 --mode teaching_standard \
 --threshold 0.3 \
 --fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
---resume ${OUTPUT_DIR}/../source_only/sim2city_source_only_48_90.pth
+--resume ./sim2city_source_only_48_90.pth

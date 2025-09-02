@@ -1,7 +1,7 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_standard_dino
+OUTPUT_DIR=./city2foggy/teaching_standard_dino_new
 
  OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26505 \

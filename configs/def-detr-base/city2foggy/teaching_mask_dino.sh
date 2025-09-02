@@ -1,7 +1,7 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_mask_1
+OUTPUT_DIR=./outputs/def-detr-base/city2foggy/teaching_mask_dino_with_sin_abs_schedule
 
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26503 \

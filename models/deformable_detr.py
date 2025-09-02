@@ -53,10 +53,11 @@ class SEAttention(nn.Module):
             nn.Conv2d(self.reduction, channels, kernel_size=1),
             nn.Sigmoid()
         )
+        torch.nn.init.constant_(self.se[3].bias, -2)
     
     def forward(self, x, y):
         se_weight = self.se(x)  # [B, C, 1, 1]
-        return y * se_weight.expand_as(y)  # 通道权重
+        return y * se_weight.expand_as(y), se_weight  # 通道权重
 class SPAttention(nn.Module):
     def __init__(self, channels, reduction_ratio=16):
         super(SPAttention, self).__init__()
@@ -118,6 +119,7 @@ class DeformableDETR(nn.Module):
             self.fuse_type = fuse_type
             out_channels = [512,1024,2048]
             self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
+            # self.inverse_proj = nn.Linear(256, 768)
             #enable fuse blocks for post-fusion
             if self.fuse_type == 'se':
                 self.se_blocks = nn.ModuleList([SEAttention(i) for i in out_channels])
@@ -128,7 +130,7 @@ class DeformableDETR(nn.Module):
 
             self.dino_transform = dino_transform
             # self.dino_factor = nn.Parameter(torch.tensor(0.01))
-            self.dino_factor = 0.01
+            self.dino_factor = nn.Parameter(torch.tensor(0.01), requires_grad=False)
             self.dino_step = 0.01
     @torch.no_grad()
     def forward_dino(self, data, output_shape=None, keyword='image_weak', max_length=560, patch_size=14,):
@@ -175,11 +177,14 @@ class DeformableDETR(nn.Module):
                 features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * torch.exp(self.learnable_weight)
                 dino_feats.append(dino_proj_feats)
         elif self.fuse_type == 'se':
+
             for target_layer in range(3):
                 #blending
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                dino_proj_feats = self.se_blocks[target_layer](features_cnn[target_layer], dino_proj_feats)
-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor    
+                dino_proj_feats, attn_weight = self.se_blocks[target_layer](dino_proj_feats, dino_proj_feats)
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor   
+                dino_feats.append(dino_proj_feats) 
+                # print(target_layer, attn_weight.mean())
         elif self.fuse_type == 'sp':
             for target_layer in range(3):
                 #blending
@@ -200,7 +205,7 @@ class DeformableDETR(nn.Module):
             features_cnn[target_layer] = features_cnn[target_layer] + attn_out * self.dino_factor
         else:
             raise  NotImplementedError
-        return features_cnn
+        return features_cnn, dino_feats
 
     def _build_input_projections(self):
         input_proj_list = []
@@ -245,10 +250,11 @@ class DeformableDETR(nn.Module):
     def forward(self, images, masks):
         # Backbone forward
         features = self.backbone(images)
+        dino_features = None
         if self.dino_backbone is not None:
             target_layer = 1
             dino_features = self.forward_dino(images, output_shape=features[target_layer].shape[2:])
-            features = self.fuse(features, dino_features, target_layer=target_layer)
+            features, dino_feats = self.fuse(features, dino_features, target_layer=target_layer)
         # Prepare input features for transformer
         src_list, mask_list = [], []
         for i, feature in enumerate(features):
@@ -287,7 +293,10 @@ class DeformableDETR(nn.Module):
         out = {
             'logit_all': outputs_class,
             'boxes_all': outputs_coord,
-            'features': features[-1].detach(),
-            # 'dino_features':dino_features
+            'features': [f.detach() for f in features],
+            # 'dino_features_proj':dino_feats,
+            'dino_features':dino_features,
+            # 'query_embed':self.inverse_proj(hs)
         }
+
         return out

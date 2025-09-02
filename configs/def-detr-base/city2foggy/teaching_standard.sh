@@ -1,7 +1,7 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_standard_tr05
+OUTPUT_DIR=./city2foggy/teaching_standard
 
  OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26505 \
@@ -24,7 +24,7 @@ main.py \
 --epoch 30 \
 --epoch_lr_drop 80 \
 --mode teaching_standard \
---threshold 0.5 \
+--threshold 0.3 \
 --fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
 --resume city2foggy_source_only_29_53.pth
