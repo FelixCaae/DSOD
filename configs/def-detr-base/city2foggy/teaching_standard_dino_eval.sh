@@ -7,8 +7,8 @@ OUTPUT_DIR=./city2foggy/teaching_standard_dino_new
 --rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
 main.py \
---fuse_type se \
---enable_dino \
+# --fuse_type se \
+# --enable_dino \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
@@ -29,6 +29,6 @@ main.py \
 --threshold 0.3 \
 --fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
---resume city2foggy_source_only_29_53.pth
+--resume ./outputs/def-detr-base/city2foggy/teaching_mask_dino_nonlinear_k15/model_last_tch.pth \
 # --resume ./city2foggy/teaching_standard_dino_new/model_best.pth
 --tag test_dynamic_weight

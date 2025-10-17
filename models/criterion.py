@@ -2,14 +2,54 @@ import torch
 from torch import nn
 from torch.nn.functional import binary_cross_entropy_with_logits, l1_loss, mse_loss
 from torch.distributed import all_reduce
-from torchvision.ops.boxes import nms
+from torchvision.ops.boxes import nms, batched_nms
 import math
 from scipy.optimize import linear_sum_assignment
 
-from utils.box_utils import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
+from utils.box_utils import box_cxcywh_to_xyxy,  box_xyxy_to_cxcywh, generalized_box_iou, box_iou
 from utils.distributed_utils import is_dist_avail_and_initialized, get_world_size
 from collections import defaultdict
 
+
+def batched_diag_iou(boxes1, boxes2, eps=1e-7):
+    """
+    计算 boxes1[i] 和 boxes2[i] 之间的 IoU（支持任意 dim >= 2，且输入为 xywh 格式）
+    
+    Args:
+        boxes1 (Tensor): (..., 4), xywh 格式
+        boxes2 (Tensor): (..., 4), xywh 格式
+        eps (float): 防止除以零的小值
+    
+    Returns:
+        Tensor: (...,) IoU 值
+    """
+    # 转换 xywh -> xyxy
+    boxes1_xyxy = torch.empty_like(boxes1)
+    boxes1_xyxy[..., 0] = boxes1[..., 0] - boxes1[..., 2] / 2  # x1 = cx - w/2
+    boxes1_xyxy[..., 1] = boxes1[..., 1] - boxes1[..., 3] / 2  # y1 = cy - h/2
+    boxes1_xyxy[..., 2] = boxes1[..., 0] + boxes1[..., 2] / 2  # x2 = cx + w/2
+    boxes1_xyxy[..., 3] = boxes1[..., 1] + boxes1[..., 3] / 2  # y2 = cy + h/2
+
+    boxes2_xyxy = torch.empty_like(boxes2)
+    boxes2_xyxy[..., 0] = boxes2[..., 0] - boxes2[..., 2] / 2
+    boxes2_xyxy[..., 1] = boxes2[..., 1] - boxes2[..., 3] / 2
+    boxes2_xyxy[..., 2] = boxes2[..., 0] + boxes2[..., 2] / 2
+    boxes2_xyxy[..., 3] = boxes2[..., 1] + boxes2[..., 3] / 2
+
+    # 计算交集区域 (broadcast 支持任意 dim)
+    x1 = torch.max(boxes1_xyxy[..., 0], boxes2_xyxy[..., 0])
+    y1 = torch.max(boxes1_xyxy[..., 1], boxes2_xyxy[..., 1])
+    x2 = torch.min(boxes1_xyxy[..., 2], boxes2_xyxy[..., 2])
+    y2 = torch.min(boxes1_xyxy[..., 3], boxes2_xyxy[..., 3])
+
+    inter_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+
+    # 计算并集区域
+    area1 = boxes1[..., 2] * boxes1[..., 3]  # w * h
+    area2 = boxes2[..., 2] * boxes2[..., 3]
+    union_area = area1 + area2 - inter_area
+
+    return inter_area / (union_area + eps)  # IoU
 
 class HungarianMatcher(nn.Module):
 
@@ -302,6 +342,7 @@ class SetCriterion(nn.Module):
     def forward(self, out, annotations=None, use_pseudo_label_weights=False):
         logit_all = out['logit_all']
         boxes_all = out['boxes_all']
+        # import pdb;pdb.set_trace()
         # Compute the average number of target boxes across all nodes, for normalization purposes
         num_boxes = sum(len(anno["labels"]) for anno in annotations) if annotations is not None else 0
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=logit_all.device)
@@ -334,9 +375,50 @@ class SetCriterion(nn.Module):
         # feature_alignment_loss = F.mse_loss(out['features'][-1], out['dino_features'][-1], reduction='mean') + F.mse_loss(out['features'][-2], out['dino_features'][-2], reduction='mean') + F.mse_loss(out['features'][-3], out['dino_features'][-3], reduction='mean')
         # loss_dict['feature_alignment_loss'] = feature_alignment_loss.detach()
         # loss += feature_alignment_loss 
-
+        enable_logit_alignment = False
+        distill_type = 'logit_mse'
+        if enable_logit_alignment and 'teacher_logit_all' in  out:
+            if distill_type == 'logit_mse':
+                logit_mse_loss = F.mse_loss(out['teacher_logit_all'], out['logit_all'])
+                loss = loss + logit_mse_loss
+                loss_dict['logit_mse_loss'] = logit_mse_loss
+            elif distill_type == 'logit+box':
+                logit_mse_loss = F.mse_loss(out['teacher_logit_all'], out['logit_all'])
+                box_l1_loss = F.smooth_l1_loss(out['teacher_boxes_all'], out['boxes_all'])
+                loss = loss + logit_mse_loss + box_l1_loss 
+                loss_dict['logit_mse_loss'] = logit_mse_loss + box_l1_loss
+            elif distill_type == 'box_only':
+                logit_mse_loss = F.mse_loss(out['teacher_logit_all'], out['logit_all'])
+                box_l1_loss = F.smooth_l1_loss(out['teacher_boxes_all'], out['boxes_all'],reduction='none').sum() / num_decoder_layers /num_boxes
+                loss = loss +  box_l1_loss 
+                loss_dict['logit_mse_loss'] =   box_l1_loss
+                
+            elif distill_type == 'sigmoid_mse':
+                logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
+                loss = loss + logit_mse_loss * 10
+                loss_dict['logit_mse_loss'] = logit_mse_loss
+            elif distill_type == 'kl':
+                logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
+                loss = loss + logit_mse_loss
+                loss_dict['logit_mse_loss'] = logit_mse_loss
+            elif distill_type == 'weighted_mse':
+                iou_weight = batched_diag_iou(box_cxcywh_to_xyxy(out['teacher_boxes_all']) , box_cxcywh_to_xyxy(out['boxes_all'])).detach()
+                logit_mse_loss = iou_weight.unsqueeze(-1) * F.mse_loss(out['teacher_logit_all'], out['logit_all'], reduction='none')
+                loss = loss + logit_mse_loss.mean()
+                loss_dict['logit_mse_loss'] = logit_mse_loss.mean()
+            elif distill_type == 'weighted_kl':
+                logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
+                loss = loss + logit_mse_loss
+                loss_dict['logit_mse_loss'] = logit_mse_loss
+    
+    
+        enable_feature_alignment = False
+        if enable_feature_alignment and 'teacher_features' in out:
+            feature_alignment_loss = F.mse_loss(out['teacher_features'][-1], out['features'][-1]) #+ F.mse_loss(out['teacher_features'][-2], out['features'][-2]) +  F.mse_loss(out['teacher_features'][-3], out['features'][-3])
+            loss += feature_alignment_loss
+            loss_dict['feature_alignment_loss'] = feature_alignment_loss
         enable_dino_alignment = False
-        if enable_dino_alignment:
+        if enable_dino_alignment and 'dino_features' in out:
             query_embed = out['query_embed'][0]
             #Given boxes_all[-1] as box input (x,y,w,h) mode, 0-1 normalzied  . Size [BS,Len_Query, 4]
             boxes = box_cxcywh_to_xyxy(boxes_all[0])[0] # take bs = 1 as default
@@ -347,8 +429,12 @@ class SetCriterion(nn.Module):
             roi_features = roi_align(out['dino_features'], rois, output_size=(1, 1))
             #Compute ROI features from DINO feature Size [BS, Channel, H, W] 
             loss_dict['query_alignment_loss'] = F.mse_loss(query_embed[0], roi_features.flatten(1), reduction='mean') 
-            loss += loss_dict['query_alignment_loss'] * 0
+            loss += loss_dict['query_alignment_loss'] * 1
+        if 'dino_features_proj' in out:
             loss_dict['dino_feats_proj_norm'] = out['dino_features_proj'][-1].norm(dim=1,p=2).mean()
+            
+        if 'dino_factor' in out:
+            loss_dict['dino_factor'] = out['dino_factor']
         return loss, loss_dict
 
 
@@ -413,3 +499,56 @@ def get_pseudo_labels(pred_logits, pred_boxes, thresholds, is_nms=False, nms_thr
     return pseudo_labels
 
 
+def merge_pseudo_labels(pseudo_labels_0, pseudo_labels_1, iou_threshold=0.7, weights=[1,1], fuse_type='nms'):
+    """
+    Merge two sets of pseudo labels using Non-Maximum Suppression (NMS)
+    
+    Args:
+        pseudo_labels_0: First set of pseudo labels (list of dicts)
+        pseudo_labels_1: Second set of pseudo labels (list of dicts)
+        iou_threshold: IoU threshold for NMS
+    
+    Returns:
+        Merged pseudo labels (list of dicts)
+    """
+    from .wbf  import weighted_boxes_fusion,nms
+    merged_labels = []
+    skip_box_thr = 0.001
+    #iter through batch
+    for labels_0, labels_1 in zip(pseudo_labels_0, pseudo_labels_1):
+        # Combine detections from both sets
+        boxes_list = [box_cxcywh_to_xyxy(labels_0['boxes']).cpu().numpy(), box_cxcywh_to_xyxy(labels_1['boxes'].cpu()).numpy().tolist()]
+        scores_list = [labels_0['scores'].cpu().numpy(), labels_1['scores'].cpu().numpy().tolist()]
+        labels_list = [labels_0['labels'].cpu().numpy(), labels_1['labels'].cpu().numpy().tolist()]
+        if fuse_type == 'nms':
+            boxes, scores, labels = nms(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_threshold)
+        elif fuse_type == 'wbf':
+            boxes, scores, labels = weighted_boxes_fusion(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_thr, skip_box_thr=skip_box_thr)
+
+        # all_scores = torch.cat([labels_0['scores'], labels_1['scores']])
+        # all_labels = torch.cat([labels_0['labels'], labels_1['labels']])
+        # all_boxes = torch.cat([labels_0['boxes'], labels_1['boxes']])
+
+        # # If no boxes, return empty result
+        # if len(all_boxes) == 0:
+        #     return pseudo_labels_0
+        #     print('zero boxes! warning!')
+        #     merged_labels.append({'scores': torch.tensor([]).to(all_boxes.device),
+        #                          'labels': torch.tensor([], dtype=torch.long).to(all_boxes.device),
+        #                          'boxes': torch.zeros(0,4).to(all_boxes.device)})
+        #     continue
+        # # Apply NMS to merge overlapping boxes
+        # boxes_xyxy = box_cxcywh_to_xyxy(all_boxes)
+        # keep_indices = batched_nms(boxes_xyxy, all_scores, all_labels, iou_threshold=0.7)
+        
+        # # Select the kept detections
+        # merged_scores = all_scores[keep_indices]
+        # merged_labels_tensor = all_labels[keep_indices]
+        # merged_boxes = all_boxes[keep_indices]
+        merged_labels.append({
+            'scores': torch.tensor(scores).cuda().float(),
+            'labels': torch.tensor(labels).cuda().long(),
+            'boxes': box_xyxy_to_cxcywh(torch.tensor(boxes).cuda().float())
+        })
+    # print(merged_labels)
+    return merged_labels

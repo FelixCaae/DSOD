@@ -1,8 +1,7 @@
 BATCH_SIZE=16
-DATA_ROOT=./data
+DATA_ROOT=./dataset
 OUTPUT_DIR=./outputs/def-detr-base/city2bdd/teaching_mask/evaluation
-
-CUDA_VISIBLE_DEVICES=1 python -u main.py \
+python -u main.py \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \

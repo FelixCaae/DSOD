@@ -1,9 +1,10 @@
-BATCH_SIZE=8
+BATCH_SIZE=1
 DATA_ROOT=./dataset
 OUTPUT_DIR=./outputs/def-detr-base/sim2city/source_only/evaluation
 
 CUDA_VISIBLE_DEVICES=1 python -u main.py \
 --backbone resnet50 \
+--enable_dino \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
 --num_classes 4 \
@@ -13,4 +14,4 @@ CUDA_VISIBLE_DEVICES=1 python -u main.py \
 --eval_batch_size ${BATCH_SIZE} \
 --mode eval \
 --output_dir ${OUTPUT_DIR} \
---resume ./sim2city_source_only_48_90.pth
+--resume ./outputs/def-detr-base/sim2city/teaching_mask_dino_const/tch_epoch29.pth

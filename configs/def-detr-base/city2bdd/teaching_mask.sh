@@ -1,9 +1,9 @@
-N_GPUS=1
+N_GPUS=8
 BATCH_SIZE=8
-DATA_ROOT=./data
-OUTPUT_DIR=./outputs/def-detr-base/city2bdd/teaching_mask
+DATA_ROOT=./dataset
+OUTPUT_DIR=./outputs/def-detr-base/city2bdd/teaching_mask_dino_init
 
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 torchrun \
+ OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26508 \
 --nproc_per_node=${N_GPUS} \
 main.py \
@@ -30,4 +30,4 @@ main.py \
 --only_class_loss \
 --use_pseudo_label_weights \
 --output_dir ${OUTPUT_DIR} \
---resume ${OUTPUT_DIR}/../source_only/city2bdd_source_only_29_09.pth
+--resume ./outputs/def-detr-base/city2bdd/teaching_mask_dino_w025/stu_epoch00_pieceid9.pth

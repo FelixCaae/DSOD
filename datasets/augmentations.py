@@ -38,6 +38,21 @@ weak_trans = ComposeImgAnno([
     base_trans
 ])
 
+midaug = ComposeImgAnno([
+    RandomApplyImgAnno(
+        [ColorJitterImgAnno(0.2, 0.2, 0.2, 0.1)], p=0.8
+    ),
+    RandomGrayScaleImgAnno(p=0.2),
+    RandomApplyImgAnno(
+        [GaussianBlurImgAnno([0.1, 2.0])], p=0.3
+    )
+])
+
+mid_aug = ComposeImgAnno([
+    midaug,
+    base_trans
+])
+
 
 strong_aug = ComposeImgAnno([
     RandomApplyImgAnno(
@@ -48,7 +63,6 @@ strong_aug = ComposeImgAnno([
         [GaussianBlurImgAnno([0.1, 2.0])], p=0.5
     )
 ])
-
 
 strong_trans = ComposeImgAnno([
     weak_aug,

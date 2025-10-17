@@ -5,7 +5,7 @@ OUTPUT_DIR=./outputs/def-detr-base/city2bdd/teaching_standard
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26504 \
 --nproc_per_node=${N_GPUS} \
-main.py \
+main_v3.py \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \

@@ -2,7 +2,7 @@ BATCH_SIZE=8
 DATA_ROOT=./data
 OUTPUT_DIR=./outputs/def-detr-base/city2foggy/teaching_mask_1/evaluation
 
-CUDA_VISIBLE_DEVICES=1 python -u main.py \
+python -u main.py \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \

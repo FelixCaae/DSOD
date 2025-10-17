@@ -16,6 +16,7 @@ def resume_and_load(model, ckpt_path, device):
 def save_ckpt(model, save_path, distributed=False):
     print("Saving checkpoints to", save_path)
     state_dict = model.state_dict() if not distributed else model.module.state_dict()
+    state_dict = {k:v for k,v in state_dict.items() if 'dino_backbone' not in k}
     torch.save(state_dict, save_path)
 
 

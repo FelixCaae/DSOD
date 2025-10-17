@@ -1,12 +1,14 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./outputs/def-detr-base/sim2city/teaching_mask_dino_with_saturate_epoch_10
+OUTPUT_DIR=./outputs/def-detr-base/sim2city/teaching_mask_dino_with_w05_a05
 
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
 main.py \
+--dino_weight 0.5 \
+--dino_alpha 0.5 \
 --enable_dino \
 --backbone resnet50 \
 --num_encoder_layers 6 \
@@ -24,7 +26,7 @@ main.py \
 --alpha_ema 0.999 \
 --epoch 35 \
 --epoch_lr_drop 80 \
---mode teaching_mask \
+--mode eval \
 --threshold 0.3 \
 --dynamic_update \
 --max_update_iter 5 \

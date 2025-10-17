@@ -86,6 +86,8 @@ class DeformableDETR(nn.Module):
                  dino_backbone=None,
                  dino_transform=None,
                  fuse_type = 'add',
+                 enable_query_alignment=False,
+                 enable_feature_alignment=False,
                  num_classes=9,
                  num_queries=300,
                  num_feature_levels=4):
@@ -114,13 +116,18 @@ class DeformableDETR(nn.Module):
         self.dino_backbone = dino_backbone
         # self.learnable_weight = nn.Parameter(torch.tensor(0.))
         if dino_backbone is not None:
+            # import pdb;pdb.set_trace()
             for param in dino_backbone.parameters():
                 param.requires_grad = False
+            if enable_query_alignment:
+                self.inverse_proj = nn.Sequential(nn.Linear(256, 768), nn.ReLU(), nn.Linear(768, 768))
+
+            #build projection blocks
             self.fuse_type = fuse_type
             out_channels = [512,1024,2048]
             self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
-            # self.inverse_proj = nn.Linear(256, 768)
-            #enable fuse blocks for post-fusion
+            
+            #maybe some fusion block
             if self.fuse_type == 'se':
                 self.se_blocks = nn.ModuleList([SEAttention(i) for i in out_channels])
             elif self.fuse_type == 'sp':
@@ -129,7 +136,6 @@ class DeformableDETR(nn.Module):
                 self.fuse_blocks = nn.ModuleList([ConvBlock(i, 1024, i, 2) for i in out_channels])
 
             self.dino_transform = dino_transform
-            # self.dino_factor = nn.Parameter(torch.tensor(0.01))
             self.dino_factor = nn.Parameter(torch.tensor(0.01), requires_grad=False)
             self.dino_step = 0.01
     @torch.no_grad()
@@ -177,12 +183,11 @@ class DeformableDETR(nn.Module):
                 features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * torch.exp(self.learnable_weight)
                 dino_feats.append(dino_proj_feats)
         elif self.fuse_type == 'se':
-
             for target_layer in range(3):
                 #blending
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                dino_proj_feats, attn_weight = self.se_blocks[target_layer](dino_proj_feats, dino_proj_feats)
                 features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor   
+                features_cnn[target_layer], attn_weight = self.se_blocks[target_layer](features_cnn[target_layer], features_cnn[target_layer])
                 dino_feats.append(dino_proj_feats) 
                 # print(target_layer, attn_weight.mean())
         elif self.fuse_type == 'sp':
@@ -254,7 +259,7 @@ class DeformableDETR(nn.Module):
         if self.dino_backbone is not None:
             target_layer = 1
             dino_features = self.forward_dino(images, output_shape=features[target_layer].shape[2:])
-            features, dino_feats = self.fuse(features, dino_features, target_layer=target_layer)
+            features, dino_feats_proj = self.fuse(features, dino_features, target_layer=target_layer)
         # Prepare input features for transformer
         src_list, mask_list = [], []
         for i, feature in enumerate(features):
@@ -293,10 +298,13 @@ class DeformableDETR(nn.Module):
         out = {
             'logit_all': outputs_class,
             'boxes_all': outputs_coord,
-            'features': [f.detach() for f in features],
-            # 'dino_features_proj':dino_feats,
-            'dino_features':dino_features,
-            # 'query_embed':self.inverse_proj(hs)
+            'features': [f for f in features],
         }
-
+        if self.dino_backbone is not None:
+            out['dino_features'] = dino_features
+            out['dino_features_proj'] = dino_feats_proj
+        if hasattr(self, 'inverse_proj'):
+            out['query_embed'] = self.inverse_proj(hs)
+        if hasattr(self, 'dino_factor'):
+            out['dino_factor'] = self.dino_factor
         return out
