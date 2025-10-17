@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from datasets.coco_style_dataset import DataPreFetcher
 from datasets.coco_eval import CocoEvaluator
 
-from models.criterion import post_process, get_pseudo_labels, get_topk_outputs, SetCriterion
+from models.criterion import post_process, merge_pseudo_labels, get_pseudo_labels, get_topk_outputs, SetCriterion
 from utils.distributed_utils import is_main_process,is_dist_avail_and_initialized
 from utils.box_utils import box_cxcywh_to_xyxy, convert_to_xywh
 from collections import defaultdict
@@ -90,7 +90,8 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                                       print_freq: int = 20,
                                       flush: bool = True,
                                       fix_update_iter: int = 1,
-                                      test_samples = []
+                                      test_samples = [],
+                                      static_teacher_model = None,
                                       ):
     """
     Train the student model with the teacher model, using only unlabeled training set target .
@@ -118,7 +119,10 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
-
+            if static_teacher_model is not None:
+                static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+                static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+                pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
         # Target student forward
         target_student_out = student_model(target_student_images, target_masks)
         target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
@@ -171,6 +175,206 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
     return epoch_loss, epoch_target_loss_dict
 
 
+def train_one_epoch_teaching_distill_standard(student_model: torch.nn.Module,
+                                      teacher_model: torch.nn.Module,
+                                      static_teacher_model,
+                                      criterion_pseudo: torch.nn.Module,
+                                      target_loader: DataLoader,
+                                      optimizer: torch.optim.Optimizer,
+                                      thresholds: List[float],
+                                      alpha_ema: float,
+                                      device: torch.device,
+                                      epoch: int,
+                                      clip_max_norm: float = 0.0,
+                                      print_freq: int = 20,
+                                      flush: bool = True,
+                                      fix_update_iter: int = 1,
+                                      test_samples = []
+                                      ):
+    """
+    Train the student model with the teacher model, using only unlabeled training set target .
+    """
+    start_time = time.time()
+    student_model.train()
+    teacher_model.train()
+    criterion_pseudo.train()
+    target_fetcher = DataPreFetcher(target_loader, device=device)
+    target_images, target_masks, _ = target_fetcher.next()
+    target_teacher_images, target_student_images = target_images[0], target_images[1]
+    # Record epoch losses
+    epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+
+    # Training data statistics
+    epoch_target_loss_dict = defaultdict(float)
+    total_iters = len(target_loader)
+
+
+    for iter in range(total_iters):
+        # Target teacher forward
+        # progressive updating weight factor
+        # alpha = 0.
+        import math
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+            # static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+            # static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+            # pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+        # Target student forward
+        #Usining Teacher images
+        target_student_out = student_model(target_teacher_images, target_masks)
+        target_student_out['teacher_features'] = teacher_out['features']
+        target_student_out['teacher_logit_all'] = teacher_out['logit_all']
+        target_student_out['teacher_boxes_all'] = teacher_out['boxes_all']
+        target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
+
+        loss = target_loss
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), clip_max_norm)
+        optimizer.step()
+
+        # Record epoch losses
+        epoch_loss += loss.detach()
+
+        # update loss_dict
+        for k, v in target_loss_dict.items():
+            epoch_target_loss_dict[k] += v.detach().cpu().item()
+
+
+        if iter % fix_update_iter == 0:
+            with torch.no_grad():
+                state_dict, student_state_dict = teacher_model.state_dict(), student_model.state_dict()
+                for key, value in state_dict.items():
+                    state_dict[key] = alpha_ema * value + (1 - alpha_ema) * student_state_dict[key].detach()
+                teacher_model.load_state_dict(state_dict)
+
+        # Data pre-fetch
+        target_images, target_masks, _ = target_fetcher.next()
+        if target_images is not None:
+            target_teacher_images, target_student_images = target_images[0], target_images[1]
+
+        # Log
+        if is_main_process() and (iter + 1) % print_freq == 0:
+            str_out = ""
+            for k,v in  target_loss_dict.items():
+                str_out+= f"{k}:{float(v)} "
+            
+            print('Teaching epoch ' + str(epoch) + ' : [ ' + str(iter + 1) + '/' + str(total_iters) + ' ] ' +
+                  'total loss: ' + str(loss.detach().cpu().numpy()) + str_out, flush=flush)
+                
+    # Final process of loss dict
+    epoch_loss /= total_iters
+    for k, v in epoch_target_loss_dict.items():
+        epoch_target_loss_dict[k] /= total_iters
+    end_time = time.time()
+    total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
+    print('Teaching epoch ' + str(epoch) + ' finished. Time cost: ' + total_time_str +
+          ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
+    return epoch_loss, epoch_target_loss_dict
+
+
+def train_one_epoch_teaching_standard_with_piece(student_model: torch.nn.Module,
+                                      teacher_model: torch.nn.Module,
+                                      criterion_pseudo: torch.nn.Module,
+                                      target_loader: DataLoader,
+                                      optimizer: torch.optim.Optimizer,
+                                      thresholds: List[float],
+                                      alpha_ema: float,
+                                      device: torch.device,
+                                      epoch: int,
+                                      clip_max_norm: float = 0.0,
+                                      print_freq: int = 20,
+                                      flush: bool = True,
+                                      fix_update_iter: int = 1,
+                                      test_samples = [],
+                                      piece_num = 10,
+                                      piece_id = 0,
+                                      target_fetcher= None,
+                                      ):
+    """
+    Train the student model with the teacher model, using only unlabeled training set target .
+    """
+    start_time = time.time()
+    student_model.train()
+    teacher_model.train()
+    criterion_pseudo.train()
+    target_fetcher = DataPreFetcher(target_loader, device=device)
+    target_images, target_masks, _ = target_fetcher.next()
+    target_teacher_images, target_student_images = target_images[0], target_images[1]
+    # Record epoch losses
+    epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+
+    # Training data statistics
+    epoch_target_loss_dict = defaultdict(float)
+    total_iters = len(target_loader) // piece_num
+
+    for iter in range(total_iters):
+        # Target teacher forward
+        # progressive updating weight factor
+        # alpha = 0.
+        if target_images is None or target_masks is None:
+            total_iters = iter
+            break
+        import math
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+
+        # Target student forward
+        target_student_out = student_model(target_student_images, target_masks)
+        target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
+
+        loss = target_loss
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), clip_max_norm)
+        optimizer.step()
+
+        # Record epoch losses
+        epoch_loss += loss.detach()
+
+        # update loss_dict
+        for k, v in target_loss_dict.items():
+            epoch_target_loss_dict[k] += v.detach().cpu().item()
+        if iter % fix_update_iter == 0:
+            with torch.no_grad():
+                state_dict, student_state_dict = teacher_model.state_dict(), student_model.state_dict()
+                for key, value in state_dict.items():
+                    state_dict[key] = alpha_ema * value + (1 - alpha_ema) * student_state_dict[key].detach()
+                teacher_model.load_state_dict(state_dict)
+
+        # Data pre-fetch
+        target_images, target_masks, _ = target_fetcher.next()
+        if target_images is not None:
+            target_teacher_images, target_student_images = target_images[0], target_images[1]
+
+        # Log
+        if is_main_process() and (iter + 1) % print_freq == 0:
+            str_out = ""
+            for k,v in  target_loss_dict.items():
+                str_out+= f"{k}:{float(v)} "
+            
+            print('Teaching epoch ' + str(epoch) + ' : [ ' + str(iter + 1) + '/' + str(total_iters) + ' ] ' +
+                  'total loss: ' + str(loss.detach().cpu().numpy()) + str_out, flush=flush)
+                
+    # Final process of loss dict
+    epoch_loss /= total_iters
+    for k, v in epoch_target_loss_dict.items():
+        epoch_target_loss_dict[k] /= total_iters
+    end_time = time.time()
+    total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
+    print('Teaching epoch ' + str(epoch) + ' finished. Time cost: ' + total_time_str +
+          ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
+    return epoch_loss, epoch_target_loss_dict,target_fetcher
+
+
 def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                                   teacher_model: torch.nn.Module,
                                   init_student_model: torch.nn.Module,
@@ -196,6 +400,8 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                                   stu_buffer_mask: List[torch.Tensor] = None,
                                   res_dict: dict = None,
                                   use_pseudo_label_weights: bool = False,
+                                  static_teacher_model  =None,
+                                  merge_weights=[1,1],
                                   use_loss_student: bool = False):
     """
     Train the student model with the teacher model, using only unlabeled training set target (plus masked target image)
@@ -215,7 +421,10 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
     # Training data statistics
     epoch_target_loss_dict = defaultdict(float)
     total_iters = len(target_loader)
-
+    # # Initialize buffers
+    # stu_buffer_cost = []
+    # stu_buffer_img = []
+    # stu_buffer_mask = []
     for iter in range(total_iters):
         # Target teacher forward
         # progressive updating weight factor
@@ -223,12 +432,10 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
-
-        # Target teacher forward
-        with torch.no_grad():
-            teacher_out = teacher_model(target_teacher_images, target_masks)
-            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
-
+            if static_teacher_model is not None:
+                static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+                static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+                pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels, weights=merge_weights)
         # Target student forward
         target_student_out = student_model(target_student_images, target_masks)
         # loss from pseudo labels of current teacher
@@ -380,6 +587,690 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
     return epoch_loss, epoch_target_loss_dict
 
 
+def train_one_epoch_teaching_mask_with_piece(student_model: torch.nn.Module,
+                                  teacher_model: torch.nn.Module,
+                                  init_student_model: torch.nn.Module,
+                                  criterion_pseudo: torch.nn.Module,
+                                  criterion_pseudo_weak: torch.nn.Module,
+                                  target_loader: DataLoader,
+                                  optimizer: torch.optim.Optimizer,
+                                  thresholds: List[float],
+                                  coef_masked_img: float,
+                                  alpha_ema: float,
+                                  device: torch.device,
+                                  epoch: int,
+                                  keep_modules: List[str],
+                                  clip_max_norm: float = 0.0,
+                                  print_freq: int = 20,
+                                  masking: Masking = None,
+                                  flush: bool = True,
+                                  piece_num = 10,
+                                  piece_id = 0,
+                                  target_fetcher= None,
+                                  fix_update_iter: int = 1,
+                                  max_update_iter: int = 5,
+                                  dynamic_update: bool = False,
+                                  stu_buffer_cost: List[float] = None,
+                                  stu_buffer_img: List[torch.Tensor] = None,
+                                  stu_buffer_mask: List[torch.Tensor] = None,
+                                  res_dict: dict = None,
+                                  use_pseudo_label_weights: bool = False,
+                                  use_loss_student: bool = False):
+    """
+    Train the student model with the teacher model, using only unlabeled training set target (plus masked target image)
+    """
+    start_time = time.time()
+    student_model.train()
+    teacher_model.train()
+    init_student_model.train()
+    criterion_pseudo.train()
+    criterion_pseudo_weak.train()
+    if piece_id == 0:
+        target_fetcher = DataPreFetcher(target_loader, device=device)
+    else:
+        target_fetcher = target_fetcher
+    target_images, target_masks, _ = target_fetcher.next()
+    target_teacher_images, target_student_images = target_images[0], target_images[1]
+    # Record epoch losses
+    epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+
+    # Training data statistics
+    epoch_target_loss_dict = defaultdict(float)
+    total_iters = len(target_loader) // piece_num
+
+    #maybe should init here
+    stu_buffer_cost = []
+    stu_buffer_img = []
+    stu_buffer_mask = []
+    for iter in range(total_iters):
+        # Target teacher forward
+        # progressive updating weight factor
+        if target_images is None or target_masks is None:
+            total_iters = iter
+            break
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+
+        # Target teacher forward
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+
+        # Target student forward
+        target_student_out = student_model(target_student_images, target_masks)
+        # loss from pseudo labels of current teacher
+        target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
+
+        # Masked target student forward
+        masked_target_images = masking(target_student_images)
+        masked_target_student_out = student_model(masked_target_images, target_masks)
+        # loss from pseudo labels of current teacher
+        masked_target_loss, masked_target_loss_dict = criterion_pseudo(masked_target_student_out, pseudo_labels)
+
+        # Final loss
+        loss = target_loss + coef_masked_img * masked_target_loss
+
+        # Loss from pseudo labels of previous student (just testing, not used)
+        # if use_loss_student:
+        #     # Loss from pseudo labels of previous student
+        #     with torch.no_grad():
+        #         student_out = student_model(target_teacher_images, target_masks)
+        #         pseudo_labels_student = get_pseudo_labels(student_out['logit_all'][-1], student_out['boxes_all'][-1],
+        #                                                   thresholds)
+        #     target_loss_student, target_loss_dict_student = criterion_pseudo_weak(target_student_out,
+        #                                                                         pseudo_labels_student, use_pseudo_label_weights)
+        #     masked_target_loss_student, masked_target_loss_dict_student = criterion_pseudo_weak(masked_target_student_out,
+        #                                                                                       pseudo_labels_student, use_pseudo_label_weights)
+        #
+        #     # Final loss
+        #     loss_student = target_loss_student + coef_masked_img * masked_target_loss_student
+        #     loss += loss_student
+
+        # Dynamic update EMA teacher : Create buffer cost and buffer image in student model
+        if dynamic_update:
+            with torch.no_grad():
+                student_out = student_model(target_teacher_images, target_masks)
+            # variance logit
+            student_out_var = student_out['logit_all'].var(dim=0)
+            var_total = student_out_var.mean()#.item()
+            if is_dist_avail_and_initialized():
+                if not isinstance(var_total, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(var_total)}")
+                dist.all_reduce(var_total, op=dist.ReduceOp.SUM)
+                var_total /= dist.get_world_size()
+            stu_buffer_cost.append(var_total.item())
+
+            # Store batch data to buffer
+            stu_buffer_img.append(target_teacher_images.clone().detach())
+            stu_buffer_mask.append(target_masks.clone().detach())
+
+            if len(stu_buffer_cost) == 1:
+                with torch.no_grad():
+                    #in this step, init_student model dino factor is updated
+                    init_student_model.load_state_dict(student_model.state_dict())
+
+            if len(stu_buffer_cost) >= 1:
+                with torch.no_grad():
+                    init_student_out = init_student_model(target_teacher_images, target_masks)
+                    pseudo_labels_init_student = get_pseudo_labels(init_student_out['logit_all'][-1], init_student_out['boxes_all'][-1],
+                                                              thresholds)
+                # Loss from pseudo labels of init student
+                init_student_loss, init_student_loss_dict = criterion_pseudo_weak(target_student_out,
+                                                                                    pseudo_labels_init_student, use_pseudo_label_weights)
+                masked_init_student_loss, masked_init_student_loss_dict = criterion_pseudo_weak(masked_target_student_out,
+                                                                                                  pseudo_labels_init_student, use_pseudo_label_weights)
+                loss_init_student = init_student_loss + coef_masked_img * masked_init_student_loss
+                loss += loss_init_student
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), clip_max_norm)
+        optimizer.step()
+
+        # Record epoch losses
+        epoch_loss += loss.detach()
+
+        # update loss_dict
+        for k, v in target_loss_dict.items():
+            epoch_target_loss_dict[k] += v.detach().cpu().item()
+
+        # Dynamic update EMA teacher : Update weight of teacher model
+        if dynamic_update:
+            if len(stu_buffer_cost) < max_update_iter:
+                all_score = eval_stu(student_model, stu_buffer_img, stu_buffer_mask)
+                compare_score = np.array(all_score) - np.array(stu_buffer_cost)
+                # print(len(stu_buffer_cost), len(all_score), np.mean(compare_score<0))
+                if np.mean(compare_score < 0) >= 0.5:
+
+                    if is_main_process():
+                        res_dict['stu_ori'].append(stu_buffer_cost)
+                        res_dict['stu_now'].append(all_score)
+                        res_dict['update_iter'].append(len(stu_buffer_cost))
+
+                        df = pd.DataFrame(res_dict)
+                        df.to_csv('dynamic_update.csv')
+
+                    # 全局更新教师模型
+                    with torch.no_grad():
+                    # 主进程计算新状态字典
+                        state_dict = {}
+                        teacher_state_dict = teacher_model.state_dict()
+                        student_state_dict = student_model.state_dict()
+                        for key in teacher_state_dict.keys():
+                            state_dict[key] = alpha_ema * teacher_state_dict[key] + (1 - alpha_ema) * student_state_dict[key].detach()
+                        # 所有GPU加载相同的状态
+                        teacher_model.load_state_dict(state_dict)
+                        # Clear buffer
+                    stu_buffer_cost = []
+                    stu_buffer_img = []
+                    stu_buffer_mask = []
+                # print('update')
+            else:
+                # print('reinitialize')
+                # print(len(stu_buffer_cost), 'Load previous student model weight')
+                with torch.no_grad():
+                    student_model = selective_reinitialize(student_model, init_student_model.state_dict(), keep_modules)
+
+                # Clear buffer
+                stu_buffer_cost = []
+                stu_buffer_img = []
+                stu_buffer_mask = []
+        else:
+            # EMA update teacher after fix iteration
+            if iter % fix_update_iter == 0:
+                with torch.no_grad():
+                    state_dict, student_state_dict = teacher_model.state_dict(), student_model.state_dict()
+                    for key, value in state_dict.items():
+                        state_dict[key] = alpha_ema * value + (1 - alpha_ema) * student_state_dict[key].detach()
+                    teacher_model.load_state_dict(state_dict)
+
+
+        # Data pre-fetch
+        target_images, target_masks, _ = target_fetcher.next()
+        if target_images is not None:
+            target_teacher_images, target_student_images = target_images[0], target_images[1]
+
+        # Log
+        if is_main_process() and (iter + 1) % print_freq == 0:
+            print('Teaching epoch ' + str(epoch) + ' : [ ' + str(iter + 1) + '/' + str(total_iters) + ' ] ' +
+             'total loss: ' + str(loss.detach().cpu().numpy()), flush=flush)
+
+    # Final process of loss dict
+    epoch_loss /= total_iters
+    for k, v in epoch_target_loss_dict.items():
+        epoch_target_loss_dict[k] /= total_iters
+    end_time = time.time()
+    total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
+    print('Teaching epoch ' + str(epoch) + ' finished. Time cost: ' + total_time_str +
+          ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
+    return epoch_loss, epoch_target_loss_dict, target_fetcher
+
+def vis_output(model_out, samples, prefix=""):
+    import os
+    import torch
+    from detectron2.structures import Instances
+    from detectron2.utils.visualizer import Visualizer
+    from detectron2.data import MetadataCatalog,Metadata
+
+    save_dir = 'vis_output/bdd100k'
+    os.makedirs(save_dir, exist_ok=True)    
+    metadata = MetadataCatalog.get("cityscape_2007_train_s")  # 注意：Cityscapes的注册名是"cityscapes"（小写）
+ # ImageNet归一化参数
+    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+    metadata  = Metadata(thing_classes=['person', 'car', 'train', 'rider', 'truck', 'motorcycle', 'bicycle', 'bus'])
+
+    for idx, (target_teacher_images) in enumerate(samples):
+        with torch.no_grad():
+            # 获取图像尺寸（假设输入是 [B, C, H, W]）
+            height, width = target_teacher_images.shape[-2:]
+            instances = Instances(image_size=(height, width))
+            # 提取预测框、类别和置信度
+            out_scores = model_out['logit_all'][-1][0, :, 1:].sigmoid()
+            out_boxes = model_out['boxes_all'][-1][0] #xywh
+            pred_boxes = out_boxes.cpu() * torch.tensor([[width,height,width,height]])  # [N, 4]
+            #convert from cxcywh to xyxy
+            pred_boxes = torch.cat([pred_boxes[:,:2] - pred_boxes[:,2:]/2,  pred_boxes[:,:2] + pred_boxes[:,2:]/2], dim=1) 
+            pred_logits = out_scores.cpu()  # [N, num_classes]
+            pred_scores, pred_classes = pred_logits.max(dim=-1)  # [N], [N]
+            # 填充Instances对象
+            instances.pred_boxes = pred_boxes[pred_scores>0.3]
+            instances.scores = pred_scores[pred_scores>0.3]
+            instances.pred_classes = pred_classes[pred_scores>0.3]
+            # 可视化（假设图像是 [0,1] 归一化的）
+            image_np = target_teacher_images.cpu().numpy()  # [C, H, W]
+            image_np = np.transpose(image_np, (1, 2, 0))  # -> [H, W, C]
+            image_np = image_np * IMAGENET_STD.numpy() + IMAGENET_MEAN.numpy()  # 反归一化
+            image_np = np.clip(image_np * 255, 0, 255).astype("uint8")
+            #这块反归一化有点问题，因为图片是根据Image Net pretrain参数归一化的 
+            vis = Visualizer(image_np, metadata=metadata, scale=1.0)
+            vis_output = vis.draw_instance_predictions(instances.to(torch.device('cpu')))
+            # 保存结果
+            output_path = os.path.join(save_dir, f"{prefix}_pred_{idx}.png")
+            vis_output.save(output_path)
+
+def train_one_epoch_teaching_mask_with_piece_distill(student_model: torch.nn.Module,
+                                static_teacher_model,
+                                  teacher_model: torch.nn.Module,
+                                  init_student_model: torch.nn.Module,
+                                  criterion_pseudo: torch.nn.Module,
+                                  criterion_pseudo_weak: torch.nn.Module,
+                                  target_loader: DataLoader,
+                                  optimizer: torch.optim.Optimizer,
+                                  thresholds: List[float],
+                                  coef_masked_img: float,
+                                  alpha_ema: float,
+                                  device: torch.device,
+                                  epoch: int,
+                                  keep_modules: List[str],
+                                  clip_max_norm: float = 0.0,
+                                  print_freq: int = 20,
+                                  masking: Masking = None,
+                                  flush: bool = True,
+                                  piece_num = 10,
+                                  piece_id = 0,
+                                  target_fetcher= None,
+                                  fix_update_iter: int = 1,
+                                  max_update_iter: int = 5,
+                                  dynamic_update: bool = False,
+                                  stu_buffer_cost: List[float] = None,
+                                  stu_buffer_img: List[torch.Tensor] = None,
+                                  stu_buffer_mask: List[torch.Tensor] = None,
+                                  res_dict: dict = None,
+                                  use_pseudo_label_weights: bool = False,
+                                  use_loss_student: bool = False):
+    """
+    Train the student model with the teacher model, using only unlabeled training set target (plus masked target image)
+    """
+    start_time = time.time()
+    student_model.train()
+    teacher_model.train()
+    init_student_model.train()
+    criterion_pseudo.train()
+    criterion_pseudo_weak.train()
+    if piece_id == 0:
+        target_fetcher = DataPreFetcher(target_loader, device=device)
+    else:
+        target_fetcher = target_fetcher
+    target_images, target_masks, _ = target_fetcher.next()
+    target_teacher_images, target_student_images = target_images[0], target_images[1]
+    # Record epoch losses
+    epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+
+    # Training data statistics
+    epoch_target_loss_dict = defaultdict(float)
+    total_iters = len(target_loader) // piece_num
+
+    #maybe should init here
+    stu_buffer_cost = []
+    stu_buffer_img = []
+    stu_buffer_mask = []
+    for iter in range(total_iters):
+        # Target teacher forward
+        # progressive updating weight factor
+        if target_images is None or target_masks is None:
+            total_iters = iter
+            break
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+            static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+            # vis_output(teacher_out, target_teacher_images, f'ema_teacher_{iter}')
+            # vis_output(static_teacher_out, target_teacher_images, f'static_teacher_{iter}')
+            # import pdb;pdb.set_trace()
+            static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+            pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+
+        # Target student forward
+        target_student_out = student_model(target_student_images, target_masks)
+        # loss from pseudo labels of current teacher
+        target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
+
+        # Masked target student forward
+        masked_target_images = masking(target_student_images)
+        masked_target_student_out = student_model(masked_target_images, target_masks)
+        # loss from pseudo labels of current teacher
+        masked_target_loss, masked_target_loss_dict = criterion_pseudo(masked_target_student_out, pseudo_labels)
+
+        # Final loss
+        loss = target_loss + coef_masked_img * masked_target_loss
+
+        # Loss from pseudo labels of previous student (just testing, not used)
+        # if use_loss_student:
+        #     # Loss from pseudo labels of previous student
+        #     with torch.no_grad():
+        #         student_out = student_model(target_teacher_images, target_masks)
+        #         pseudo_labels_student = get_pseudo_labels(student_out['logit_all'][-1], student_out['boxes_all'][-1],
+        #                                                   thresholds)
+        #     target_loss_student, target_loss_dict_student = criterion_pseudo_weak(target_student_out,
+        #                                                                         pseudo_labels_student, use_pseudo_label_weights)
+        #     masked_target_loss_student, masked_target_loss_dict_student = criterion_pseudo_weak(masked_target_student_out,
+        #                                                                                       pseudo_labels_student, use_pseudo_label_weights)
+        #
+        #     # Final loss
+        #     loss_student = target_loss_student + coef_masked_img * masked_target_loss_student
+        #     loss += loss_student
+
+        # Dynamic update EMA teacher : Create buffer cost and buffer image in student model
+        if dynamic_update:
+            with torch.no_grad():
+                student_out = student_model(target_teacher_images, target_masks)
+            # variance logit
+            student_out_var = student_out['logit_all'].var(dim=0)
+            var_total = student_out_var.mean()#.item()
+            if is_dist_avail_and_initialized():
+                if not isinstance(var_total, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(var_total)}")
+                dist.all_reduce(var_total, op=dist.ReduceOp.SUM)
+                var_total /= dist.get_world_size()
+            stu_buffer_cost.append(var_total.item())
+
+            # Store batch data to buffer
+            stu_buffer_img.append(target_teacher_images.clone().detach())
+            stu_buffer_mask.append(target_masks.clone().detach())
+
+            if len(stu_buffer_cost) == 1:
+                with torch.no_grad():
+                    #in this step, init_student model dino factor is updated
+                    init_student_model.load_state_dict(student_model.state_dict())
+
+            if len(stu_buffer_cost) >= 1:
+                with torch.no_grad():
+                    init_student_out = init_student_model(target_teacher_images, target_masks)
+                    pseudo_labels_init_student = get_pseudo_labels(init_student_out['logit_all'][-1], init_student_out['boxes_all'][-1],
+                                                              thresholds)
+                # Loss from pseudo labels of init student
+                init_student_loss, init_student_loss_dict = criterion_pseudo_weak(target_student_out,
+                                                                                    pseudo_labels_init_student, use_pseudo_label_weights)
+                masked_init_student_loss, masked_init_student_loss_dict = criterion_pseudo_weak(masked_target_student_out,
+                                                                                                  pseudo_labels_init_student, use_pseudo_label_weights)
+                loss_init_student = init_student_loss + coef_masked_img * masked_init_student_loss
+                loss += loss_init_student
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), clip_max_norm)
+        optimizer.step()
+
+        # Record epoch losses
+        epoch_loss += loss.detach()
+
+        # update loss_dict
+        for k, v in target_loss_dict.items():
+            epoch_target_loss_dict[k] += v.detach().cpu().item()
+
+        # Dynamic update EMA teacher : Update weight of teacher model
+        if dynamic_update:
+            if len(stu_buffer_cost) < max_update_iter:
+                all_score = eval_stu(student_model, stu_buffer_img, stu_buffer_mask)
+                compare_score = np.array(all_score) - np.array(stu_buffer_cost)
+                # print(len(stu_buffer_cost), len(all_score), np.mean(compare_score<0))
+                if np.mean(compare_score < 0) >= 0.5:
+
+                    if is_main_process():
+                        res_dict['stu_ori'].append(stu_buffer_cost)
+                        res_dict['stu_now'].append(all_score)
+                        res_dict['update_iter'].append(len(stu_buffer_cost))
+
+                        df = pd.DataFrame(res_dict)
+                        df.to_csv('dynamic_update.csv')
+
+                    # 全局更新教师模型
+                    with torch.no_grad():
+                    # 主进程计算新状态字典
+                        state_dict = {}
+                        teacher_state_dict = teacher_model.state_dict()
+                        student_state_dict = student_model.state_dict()
+                        for key in teacher_state_dict.keys():
+                            state_dict[key] = alpha_ema * teacher_state_dict[key] + (1 - alpha_ema) * student_state_dict[key].detach()
+                        # 所有GPU加载相同的状态
+                        teacher_model.load_state_dict(state_dict)
+                        # Clear buffer
+                    stu_buffer_cost = []
+                    stu_buffer_img = []
+                    stu_buffer_mask = []
+                # print('update')
+            else:
+                # print('reinitialize')
+                # print(len(stu_buffer_cost), 'Load previous student model weight')
+                with torch.no_grad():
+                    student_model = selective_reinitialize(student_model, init_student_model.state_dict(), keep_modules)
+
+                # Clear buffer
+                stu_buffer_cost = []
+                stu_buffer_img = []
+                stu_buffer_mask = []
+        else:
+            # EMA update teacher after fix iteration
+            if iter % fix_update_iter == 0:
+                with torch.no_grad():
+                    state_dict, student_state_dict = teacher_model.state_dict(), student_model.state_dict()
+                    for key, value in state_dict.items():
+                        state_dict[key] = alpha_ema * value + (1 - alpha_ema) * student_state_dict[key].detach()
+                    teacher_model.load_state_dict(state_dict)
+
+
+        # Data pre-fetch
+        target_images, target_masks, _ = target_fetcher.next()
+        if target_images is not None:
+            target_teacher_images, target_student_images = target_images[0], target_images[1]
+
+        # Log
+        if is_main_process() and (iter + 1) % print_freq == 0:
+            print('Teaching epoch ' + str(epoch) + ' : [ ' + str(iter + 1) + '/' + str(total_iters) + ' ] ' +
+             'total loss: ' + str(loss.detach().cpu().numpy()), flush=flush)
+
+    # Final process of loss dict
+    epoch_loss /= total_iters
+    for k, v in epoch_target_loss_dict.items():
+        epoch_target_loss_dict[k] /= total_iters
+    end_time = time.time()
+    total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
+    print('Teaching epoch ' + str(epoch) + ' finished. Time cost: ' + total_time_str +
+          ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
+    return epoch_loss, epoch_target_loss_dict, target_fetcher
+
+def train_one_epoch_teaching_mask_distill(student_model: torch.nn.Module,
+                                  teacher_model: torch.nn.Module,
+                                  init_student_model: torch.nn.Module,
+                                  static_teacher_model: torch.nn.Module,
+                                  criterion_pseudo: torch.nn.Module,
+                                  criterion_pseudo_weak: torch.nn.Module,
+                                  target_loader: DataLoader,
+                                  optimizer: torch.optim.Optimizer,
+                                  thresholds: List[float],
+                                  coef_masked_img: float,
+                                  alpha_ema: float,
+                                  device: torch.device,
+                                  epoch: int,
+                                  keep_modules: List[str],
+                                  clip_max_norm: float = 0.0,
+                                  print_freq: int = 20,
+                                  masking: Masking = None,
+                                  flush: bool = True,
+                                  fix_update_iter: int = 1,
+                                  max_update_iter: int = 5,
+                                  dynamic_update: bool = False,
+                                  stu_buffer_cost: List[float] = None,
+                                  stu_buffer_img: List[torch.Tensor] = None,
+                                  stu_buffer_mask: List[torch.Tensor] = None,
+                                  res_dict: dict = None,
+                                  use_pseudo_label_weights: bool = False,
+                                  use_loss_student: bool = False):
+    """
+    Train the student model with the teacher model, using only unlabeled training set target (plus masked target image)
+    """
+    start_time = time.time()
+    student_model.train()
+    teacher_model.train()
+    static_teacher_model.train()
+    init_student_model.train()
+    criterion_pseudo.train()
+    criterion_pseudo_weak.train()
+    target_fetcher = DataPreFetcher(target_loader, device=device)
+    target_images, target_masks, _ = target_fetcher.next()
+    target_teacher_images, target_student_images = target_images[0], target_images[1]
+    # Record epoch losses
+    epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+
+    # Training data statistics
+    epoch_target_loss_dict = defaultdict(float)
+    total_iters = len(target_loader)
+    # # Initialize buffers
+    # stu_buffer_cost = []
+    # stu_buffer_img = []
+    # stu_buffer_mask = []
+    for iter in range(total_iters):
+        # Target teacher forward
+        # progressive updating weight factor
+        with torch.no_grad():
+            teacher_out = teacher_model(target_teacher_images, target_masks)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+            static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+            static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+            pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+            # pseudo_labels = static_pseudo_labels
+
+        # Target student forward
+        target_student_out = student_model(target_student_images, target_masks)
+        # loss from pseudo labels of current teacher
+        target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
+
+        # Masked target student forward
+        masked_target_images = masking(target_student_images)
+        masked_target_student_out = student_model(masked_target_images, target_masks)
+        # loss from pseudo labels of current teacher
+        masked_target_loss, masked_target_loss_dict = criterion_pseudo(masked_target_student_out, pseudo_labels)
+
+        # Final loss
+        loss = target_loss + coef_masked_img * masked_target_loss
+
+
+        # Dynamic update EMA teacher : Create buffer cost and buffer image in student model
+        if dynamic_update:
+            with torch.no_grad():
+                student_out = student_model(target_teacher_images, target_masks)
+            # variance logit
+            student_out_var = student_out['logit_all'].var(dim=0)
+            var_total = student_out_var.mean()#.item()
+            if is_dist_avail_and_initialized():
+                if not isinstance(var_total, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(var_total)}")
+                dist.all_reduce(var_total, op=dist.ReduceOp.SUM)
+                var_total /= dist.get_world_size()
+            stu_buffer_cost.append(var_total.item())
+
+            # Store batch data to buffer
+            stu_buffer_img.append(target_teacher_images.clone().detach())
+            stu_buffer_mask.append(target_masks.clone().detach())
+
+            if len(stu_buffer_cost) == 1:
+                with torch.no_grad():
+                    init_student_model.load_state_dict(student_model.state_dict())
+
+            if len(stu_buffer_cost) >= 1:
+                with torch.no_grad():
+                    init_student_out = init_student_model(target_teacher_images, target_masks)
+                    pseudo_labels_init_student = get_pseudo_labels(init_student_out['logit_all'][-1], init_student_out['boxes_all'][-1],
+                                                              thresholds)
+                    pseudo_labels_init_student = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+                # Loss from pseudo labels of init student
+                init_student_loss, init_student_loss_dict = criterion_pseudo_weak(target_student_out,
+                                                                                    pseudo_labels_init_student, use_pseudo_label_weights)
+                masked_init_student_loss, masked_init_student_loss_dict = criterion_pseudo_weak(masked_target_student_out,
+                                                                                                  pseudo_labels_init_student, use_pseudo_label_weights)
+                loss_init_student = init_student_loss + coef_masked_img * masked_init_student_loss
+                loss += loss_init_student
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), clip_max_norm)
+        optimizer.step()
+
+        # Record epoch losses
+        epoch_loss += loss.detach()
+
+        # update loss_dict
+        for k, v in target_loss_dict.items():
+            epoch_target_loss_dict[k] += v.detach().cpu().item()
+
+        # Dynamic update EMA teacher : Update weight of teacher model
+        if dynamic_update:
+            if len(stu_buffer_cost) < max_update_iter:
+                all_score = eval_stu(student_model, stu_buffer_img, stu_buffer_mask)
+                compare_score = np.array(all_score) - np.array(stu_buffer_cost)
+                # print(len(stu_buffer_cost), len(all_score), np.mean(compare_score<0))
+                if np.mean(compare_score < 0) >= 0.5:
+
+                    if is_main_process():
+                        res_dict['stu_ori'].append(stu_buffer_cost)
+                        res_dict['stu_now'].append(all_score)
+                        res_dict['update_iter'].append(len(stu_buffer_cost))
+
+                        df = pd.DataFrame(res_dict)
+                        df.to_csv('dynamic_update.csv')
+
+                    # 全局更新教师模型
+                    with torch.no_grad():
+                    # 主进程计算新状态字典
+                        state_dict = {}
+                        teacher_state_dict = teacher_model.state_dict()
+                        student_state_dict = student_model.state_dict()
+                        for key in teacher_state_dict.keys():
+                            state_dict[key] = alpha_ema * teacher_state_dict[key] + (1 - alpha_ema) * student_state_dict[key].detach()
+                        # 所有GPU加载相同的状态
+                        teacher_model.load_state_dict(state_dict)
+                        # Clear buffer
+                    stu_buffer_cost = []
+                    stu_buffer_img = []
+                    stu_buffer_mask = []
+                # print('update')
+            else:
+                # print('reinitialize')
+                # print(len(stu_buffer_cost), 'Load previous student model weight')
+                with torch.no_grad():
+                    student_model = selective_reinitialize(student_model, init_student_model.state_dict(), keep_modules)
+
+                # Clear buffer
+                stu_buffer_cost = []
+                stu_buffer_img = []
+                stu_buffer_mask = []
+        else:
+            # EMA update teacher after fix iteration
+            if iter % fix_update_iter == 0:
+                with torch.no_grad():
+                    state_dict, student_state_dict = teacher_model.state_dict(), student_model.state_dict()
+                    for key, value in state_dict.items():
+                        state_dict[key] = alpha_ema * value + (1 - alpha_ema) * student_state_dict[key].detach()
+                    teacher_model.load_state_dict(state_dict)
+
+
+        # Data pre-fetch
+        target_images, target_masks, _ = target_fetcher.next()
+        if target_images is not None:
+            target_teacher_images, target_student_images = target_images[0], target_images[1]
+
+        # Log
+        if is_main_process() and (iter + 1) % print_freq == 0:
+            print('Teaching epoch ' + str(epoch) + ' : [ ' + str(iter + 1) + '/' + str(total_iters) + ' ] ' +
+                  'total loss: ' + str(loss.detach().cpu().numpy()), flush=flush)
+    
+    # Final process of loss dict
+    epoch_loss /= total_iters
+    for k, v in epoch_target_loss_dict.items():
+        epoch_target_loss_dict[k] /= total_iters
+    end_time = time.time()
+    total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
+    print('Teaching epoch ' + str(epoch) + ' finished. Time cost: ' + total_time_str +
+          ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
+    return epoch_loss, epoch_target_loss_dict
 @torch.no_grad()
 def evaluate(model: torch.nn.Module,
              criterion: torch.nn.Module,

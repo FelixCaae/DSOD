@@ -12,12 +12,16 @@ from build_modules import *
 from datasets.augmentations import train_trans, val_trans, strong_trans
 from utils import get_rank, init_distributed_mode, resume_and_load, save_ckpt, selective_reinitialize, is_main_process
 
-
 def get_args_parser(parser):
     # Model Settings
     parser.add_argument('--backbone', default='resnet50', type=str)
     ##
+    parser.add_argument('--circulum_aug', action='store_true')
     parser.add_argument('--enable_dino', action='store_true')
+    parser.add_argument('--dino_alpha', type=float, default=1)
+    parser.add_argument('--dino_weight', type=float, default=0.5)
+    parser.add_argument('--enable_query_alignment', action='store_true')
+    parser.add_argument('--enable_feature_alignment', action='store_true')
     parser.add_argument('--fuse_type', default='add')
     ##
     parser.add_argument('--pos_encoding', default='sine', type=str)
@@ -351,6 +355,11 @@ def js_divergence(p, q, eps=1e-10):
     q = np.clip(q, eps, 1.0)
     m = 0.5 * (p + q)
     return 0.5 * (entropy(p, m, axis=-1) + entropy(q, m, axis=-1)).mean()
+def range_mapping(value, mapping_rules):
+    for (start, end), mapped_value in mapping_rules.items():
+        if start <= value <= end:
+            return mapped_value
+    return None
 
 # Teaching
 def teaching(model_stu, device):
@@ -401,16 +410,27 @@ def teaching(model_stu, device):
         pass
     # init_out = infer_model(model_tch, test_samples)
     # stab_factor = binary_search(model_tch, test_samples, init_out, stability_target=0.7)
+
     for epoch in range(args.epoch):
-        if epoch == 1:
-            pass
-            #fast updating teacher parameter
-            # model_tch.module.load_state_dict(model_stu.module.state_dict())
+        if args.circulum_aug:
+            mapping_rules = {
+                (0, 5): 0,
+                (6, 10): 1,
+                (11, 100): 2,
+            }
+            aug_level = range_mapping(epoch)
+            target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train', aug_level)
+
         print('dynamic updating teacher dino weight')
         if args.enable_dino:
-            model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
-            model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
+            phase = 10
+            if epoch<phase:
+                model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
+                # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
+                # torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
 
+            model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
+            init_model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
         #adaptive adjusting teacher dino factor
         # dino_factor =self_consistency_update(model_tch, test_samples)
         # model_tch.module.dino_factor.data = dino_factor
@@ -513,9 +533,10 @@ def teaching(model_stu, device):
             if epoch == args.epoch - 1:
                 save_ckpt(model_tch, output_dir/'model_last_tch.pth', args.distributed)
                 save_ckpt(model_stu, output_dir/'model_last_stu.pth', args.distributed)
-        # if (epoch+1) % 5 == 0:
-        #     save_ckpt(model_tch, output_dir/f'tch_epoch{epoch:02}.pth', args.distributed)
-        #     save_ckpt(model_stu, output_dir/f'stu_epoch{epoch:02}.pth', args.distributed)
+        if (epoch+1) % 5 == 0:
+            save_ckpt(model_tch, output_dir/f'tch_epoch{epoch:02}.pth', args.distributed)
+            save_ckpt(model_stu, output_dir/f'stu_epoch{epoch:02}.pth', args.distributed)
+        writer.flush()
     end_time = time.time()
     total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
     print('Teaching finished. Time cost: ' + total_time_str + ' . Best mAP50: ' + str(ap50_best), flush=args.flush)

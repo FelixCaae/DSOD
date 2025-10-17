@@ -7,7 +7,7 @@ from models.positional_encoding import PositionEncodingSine
 from models.deformable_detr import DeformableDETR
 from models.deformable_transformer import DeformableTransformer
 from models.criterion import SetCriterion
-from datasets.augmentations import weak_aug, strong_aug, base_trans
+from datasets.augmentations import weak_aug, strong_aug, mid_aug,base_trans
 
 
 def build_sampler(args, dataset, split):
@@ -40,13 +40,14 @@ def build_dataloader(args, dataset_name, domain, split, trans):
     return data_loader
 
 
-def build_dataloader_teaching(args, dataset_name, domain, split):
+def build_dataloader_teaching(args, dataset_name, domain, split, aug_level=2):
+    aug = [weak_aug, mid_aug, strong_aug][aug_level]
     dataset = CocoStyleDatasetTeaching(root_dir=args.data_root,
                                        dataset_name=dataset_name,
                                        domain=domain,
                                        split=split,
                                        weak_aug=weak_aug,
-                                       strong_aug=strong_aug,
+                                       strong_aug=aug,
                                        final_trans=base_trans)
     batch_sampler = build_sampler(args, dataset, split)
     data_loader = DataLoader(dataset=dataset,
@@ -96,7 +97,9 @@ def build_model(args, device):
         num_classes=args.num_classes,
         num_queries=args.num_queries,
         num_feature_levels=args.num_feature_levels,
-        fuse_type= args.fuse_type
+        fuse_type= args.fuse_type,
+        enable_query_alignment = args.enable_query_alignment,
+        enable_feature_alignment = args.enable_feature_alignment,
     )
     model.to(device)
     return model
