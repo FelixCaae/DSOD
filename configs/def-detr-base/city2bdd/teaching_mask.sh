@@ -30,4 +30,4 @@ main.py \
 --only_class_loss \
 --use_pseudo_label_weights \
 --output_dir ${OUTPUT_DIR} \
---resume ./outputs/def-detr-base/city2bdd/teaching_mask_dino_w025/stu_epoch00_pieceid9.pth
+--resume ./city2bdd_source_only_29_09.pth

@@ -70,6 +70,7 @@ def get_args_parser(parser):
     parser.add_argument('--max_update_iter', default=5, type=int)
     parser.add_argument('--use_pseudo_label_weights', action="store_true")
     parser.add_argument('--use_loss_student', action="store_true")
+    parser.add_argument('--use_extra_pseudo_label', action='store_true')
     # Dynamic threshold (DT) parameters
     parser.add_argument('--threshold', default=0.3, type=float)
     parser.add_argument('--alpha_dt', default=0.5, type=float)
@@ -89,6 +90,8 @@ def get_args_parser(parser):
     parser.add_argument('--print_freq', default=100, type=int)
     parser.add_argument('--flush', default=True, type=bool)
     parser.add_argument("--resume", default="", type=str)
+    parser.add_argument("--test_stability", default="", type=str)
+    
     parser.add_argument("--tag", default="", type=str)
 
 def set_random_seed(seed):
@@ -172,45 +175,6 @@ def single_domain_training(model, device):
           ' . Best mAP50: ' + str(ap50_best), flush=args.flush)
 import torch
 
-def batched_diag_iou(boxes1, boxes2, eps=1e-7):
-    """
-    计算 boxes1[i] 和 boxes2[i] 之间的 IoU（支持任意 dim >= 2，且输入为 xywh 格式）
-    
-    Args:
-        boxes1 (Tensor): (..., 4), xywh 格式
-        boxes2 (Tensor): (..., 4), xywh 格式
-        eps (float): 防止除以零的小值
-    
-    Returns:
-        Tensor: (...,) IoU 值
-    """
-    # 转换 xywh -> xyxy
-    boxes1_xyxy = torch.empty_like(boxes1)
-    boxes1_xyxy[..., 0] = boxes1[..., 0] - boxes1[..., 2] / 2  # x1 = cx - w/2
-    boxes1_xyxy[..., 1] = boxes1[..., 1] - boxes1[..., 3] / 2  # y1 = cy - h/2
-    boxes1_xyxy[..., 2] = boxes1[..., 0] + boxes1[..., 2] / 2  # x2 = cx + w/2
-    boxes1_xyxy[..., 3] = boxes1[..., 1] + boxes1[..., 3] / 2  # y2 = cy + h/2
-
-    boxes2_xyxy = torch.empty_like(boxes2)
-    boxes2_xyxy[..., 0] = boxes2[..., 0] - boxes2[..., 2] / 2
-    boxes2_xyxy[..., 1] = boxes2[..., 1] - boxes2[..., 3] / 2
-    boxes2_xyxy[..., 2] = boxes2[..., 0] + boxes2[..., 2] / 2
-    boxes2_xyxy[..., 3] = boxes2[..., 1] + boxes2[..., 3] / 2
-
-    # 计算交集区域 (broadcast 支持任意 dim)
-    x1 = torch.max(boxes1_xyxy[..., 0], boxes2_xyxy[..., 0])
-    y1 = torch.max(boxes1_xyxy[..., 1], boxes2_xyxy[..., 1])
-    x2 = torch.min(boxes1_xyxy[..., 2], boxes2_xyxy[..., 2])
-    y2 = torch.min(boxes1_xyxy[..., 3], boxes2_xyxy[..., 3])
-
-    inter_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
-
-    # 计算并集区域
-    area1 = boxes1[..., 2] * boxes1[..., 3]  # w * h
-    area2 = boxes2[..., 2] * boxes2[..., 3]
-    union_area = area1 + area2 - inter_area
-
-    return inter_area / (union_area + eps)  # IoU
 @torch.no_grad()
 def infer_model(model, samples):
     # out_list = []
@@ -229,43 +193,46 @@ def caculate_stability( init_out, new_out):
     from scipy.optimize import linear_sum_assignment
     import torchvision
     from utils.box_utils import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
+    import torch.nn.functional as F
     cls_out_init, box_out_init = init_out
     box_out_init = [box_cxcywh_to_xyxy(box) for box in box_out_init]
-    eps = 1e-6
-    cls_new_out, box_new_out = new_out
-    box_new_out = [box_cxcywh_to_xyxy(box) for box in box_new_out]
+    cls_out_new, box_out_new = new_out
+    box_out_new = [box_cxcywh_to_xyxy(box) for box in box_out_new]
 
-    # if is_main_process():
-    #     vis_output(init_out, samples, 'init')
-    #     vis_output(new_out, samples, f'test_{model_strip.dino_factor.data}')
     iou_list, cls_list = [], []
     for i in range(len(cls_out_init)):
-        if len(box_new_out[i]) == 0 or len(box_out_init[i]) == 0:
+        if len(box_out_new[i]) == 0 or len(box_out_init[i]) == 0:
             iou_list.append(0.0)
             cls_list.append(0.0)
             continue
-        
-        # 计算 IoU 和分类相似度
-        init_score, init_cls = cls_out_init[i].max(dim=-1)
-        new_score, new_cls = cls_new_out[i].max(dim=-1)
-        mean_score = (new_score.unsqueeze(1) + init_score.unsqueeze(0)) / 2
-        cls_sim = (new_cls.unsqueeze(1) == init_cls.unsqueeze(0)) * mean_score
-        bbox_iou = box_iou(box_new_out[i], box_out_init[i])[0] * mean_score
-        
-        # 匈牙利匹配
-        C = - (cls_sim + bbox_iou)
-        ind_i, ind_j = linear_sum_assignment(C.cpu())
-        z = mean_score[ind_i, ind_j].sum() + 1e-6
-        iou_list.append(bbox_iou[ind_i, ind_j].sum()/ z)
-        cls_list.append(cls_sim[ind_i, ind_j].sum()/z)
 
+        #select top 50 instance in init cls_out
+        init_score, init_cls = cls_out_init[i].max(dim=-1)
+        _, topk_idx = init_score.topk(50,0, True)
+        
+        cls_sim = F.cosine_similarity(cls_out_init[i][topk_idx], cls_out_new[i][topk_idx], dim=-1).mean()
+        iou_sim = torch.diag(box_iou(box_out_init[i][topk_idx], box_out_new[i][topk_idx])[0]).mean()
+        # 计算 IoU 和分类相似度
+
+        # init_score, init_cls = cls_out_init[i].max(dim=-1)
+        # new_score, new_cls = cls_out_new[i].max(dim=-1)
+        # mean_score = (new_score.unsqueeze(1) + init_score.unsqueeze(0)) / 2
+        # cls_sim = (new_cls.unsqueeze(1) == init_cls.unsqueeze(0)) * mean_score
+        
+        # # 匈牙利匹配
+        # C = - (cls_sim + bbox_iou)
+        # ind_i, ind_j = linear_sum_assignment(C.cpu())
+        # z = mean_score[ind_i, ind_j].sum() + 1e-6
+        # iou_list.append(bbox_iou[ind_i, ind_j].sum()/ z)
+        # cls_list.append(cls_sim[ind_i, ind_j].sum()/z)
+        iou_list.append(iou_sim)
+        cls_list.append(cls_sim)
     # 综合一致性
     consist_cls_pred = torch.mean(torch.stack(cls_list))
     consist_iou_pred = torch.mean(torch.stack(iou_list))
-    consist_pred = torch.sqrt(consist_iou_pred * consist_cls_pred + eps)
-    
-    print(f"Consistency: IoU={consist_iou_pred:.4f}, Cls={consist_cls_pred:.4f}")
-    return consist_pred
+    consist_pred = torch.sqrt(consist_iou_pred * consist_cls_pred )
+    result = {'Loc':consist_iou_pred, 'Cls':consist_cls_pred}
+    return result
 def binary_search(model, samples, init_out, stability_target=0.9, search_range=[0,1], iter_num = 5, eps=1e-6):
     # 提前转换边界框格式
     # 动态调整
@@ -282,90 +249,74 @@ def binary_search(model, samples, init_out, stability_target=0.9, search_range=[
         print(f"Iter {i} Factor={model.module.dino_factor.data:.4f}, Step={model.module.dino_step:.4f}")
     model.module.dino_factor.data = old_factor
     return (start_pos + end_pos) / 2
-def self_consistency_update(model, samples, consistency_thresh=0.9, scale=1.1):
-    new_out = infer_model(model, samples)
-    old_dino_factor = model.module.dino_factor.data
-    model.module.dino_factor.data.zero_()
+
+def find_elbow_point(factors, metrics):
+    """肘部法则：寻找曲率最大的点"""
+    # 将所有点与首尾连线比较
+    start_point = np.array([factors[0], metrics[0]])
+    end_point = np.array([factors[-1], metrics[-1]])
+    
+    max_distance = 0
+    elbow_index = 0
+    
+    for i in range(1, len(factors)-1):
+        point = np.array([factors[i], metrics[i]])
+        # 计算点到首尾连线的距离
+        distance = point_line_distance(point, start_point, end_point)
+        
+        if distance > max_distance:
+            max_distance = distance
+            elbow_index = i
+    
+    return {
+        'factor': factors[elbow_index],
+        'metric_value': metrics[elbow_index],
+        'method': 'elbow',
+        'index': elbow_index
+    }
+def point_line_distance(point, line_start, line_end):
+    """计算点到直线的距离"""
+    numerator = abs(
+        (line_end[1]-line_start[1])*point[0] - 
+        (line_end[0]-line_start[0])*point[1] + 
+        line_end[0]*line_start[1] - line_end[1]*line_start[0]
+    )
+    denominator = np.sqrt(
+        (line_end[1]-line_start[1])**2 + (line_end[0]-line_start[0])**2
+    )
+    return numerator / denominator if denominator != 0 else 0
+def test_stability(model, samples, stability_target=0.9, search_range=[0,1], iter_num = 10, eps=1e-6):
+    start_pos, end_pos = search_range
+    old_factor = model.module.dino_factor.data
+    model.module.dino_factor.data = torch.tensor(0.).cuda()
     init_out = infer_model(model, samples)
-    stability_score = caculate_stability(init_out, new_out)
-    if stability_score > consistency_thresh:
-        return  old_dino_factor * scale
-    return old_dino_factor
-    # else:
-    # model.module.dino_factor.data = old_dino_factor / scale
-def vis_output(model_out, samples, prefix=""):
-    import os
-    import torch
-    from detectron2.structures import Instances
-    from detectron2.utils.visualizer import Visualizer
-    from detectron2.data import MetadataCatalog,Metadata
-
-    save_dir = 'vis_output'
-    os.makedirs(save_dir, exist_ok=True)    
-    metadata = MetadataCatalog.get("cityscape_2007_train_s")  # 注意：Cityscapes的注册名是"cityscapes"（小写）
- # ImageNet归一化参数
-    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
-    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
-    metadata  = Metadata(thing_classes=['person', 'car', 'train', 'rider', 'truck', 'motorcycle', 'bicycle', 'bus'])
-    for idx, (target_teacher_images, target_masks) in enumerate(samples):
-        with torch.no_grad():
-            # 获取图像尺寸（假设输入是 [B, C, H, W]）
-            height, width = target_teacher_images.shape[-2:]
-            instances = Instances(image_size=(height, width))
-            # 提取预测框、类别和置信度
-            out_scores, out_boxes = model_out[0][idx], model_out[1][idx]
-            pred_boxes = out_boxes.cpu() * torch.tensor([[width,height,width,height]])  # [N, 4]
-            #convert from cxcywh to xyxy
-            pred_boxes = torch.cat([pred_boxes[:,:2] - pred_boxes[:,2:]/2,  pred_boxes[:,:2] + pred_boxes[:,2:]/2], dim=1) 
-            pred_logits = out_scores.cpu()  # [N, num_classes]
-            pred_scores, pred_classes = pred_logits.max(dim=-1)  # [N], [N]
-            # 填充Instances对象
-            instances.pred_boxes = pred_boxes[pred_scores>0.3]
-            instances.scores = pred_scores[pred_scores>0.3]
-            instances.pred_classes = pred_classes[pred_scores>0.3]
-            # 可视化（假设图像是 [0,1] 归一化的）
-            image_np = target_teacher_images[0].cpu().numpy()  # [C, H, W]
-            image_np = np.transpose(image_np, (1, 2, 0))  # -> [H, W, C]
-            image_np = image_np * IMAGENET_STD.numpy() + IMAGENET_MEAN.numpy()  # 反归一化
-            image_np = np.clip(image_np * 255, 0, 255).astype("uint8")
-            #这块反归一化有点问题，因为图片是根据Image Net pretrain参数归一化的 
-            vis = Visualizer(image_np, metadata=metadata, scale=1.0)
-            vis_output = vis.draw_instance_predictions(instances.to(torch.device('cpu')))
-            # 保存结果
-            output_path = os.path.join(save_dir, f"{prefix}_pred_{idx}.png")
-            vis_output.save(output_path)
-
-def sample_random_samples(dataloader, device, sample_num=10):
-    target_fetcher = DataPreFetcher(dataloader,  device=device)
-    samples = []
-    i = 0
-    sample_idx = np.random.choice(np.arange(len(dataloader)), sample_num, replace=False)
-    for i in range(len(dataloader)):
-        if i not in sample_idx:
-            continue
-        images, masks, _  = target_fetcher.next()
-        samples.append([images[1], masks])
-    return samples
-
-def js_divergence(p, q, eps=1e-10):
-    from scipy.stats import entropy
-    p = p.cpu().numpy()
-    q = q.cpu().numpy()
-    p = np.clip(p, eps, 1.0)  # 避免log(0)
-    q = np.clip(q, eps, 1.0)
-    m = 0.5 * (p + q)
-    return 0.5 * (entropy(p, m, axis=-1) + entropy(q, m, axis=-1)).mean()
-def range_mapping(value, mapping_rules):
-    for (start, end), mapped_value in mapping_rules.items():
-        if start <= value <= end:
-            return mapped_value
-    return None
-
+    loc_list = []
+    cls_list = []
+    data_x = np.linspace(search_range[0],search_range[1], iter_num)
+    # for layer in range(3):
+    for factor in data_x:
+        model.module.dino_factor.data = torch.tensor(factor).cuda()
+        new_out = infer_model(model, samples)
+        consist_pred = caculate_stability(init_out, new_out)
+        loc_list.append(float(consist_pred['Loc'].cpu()))
+        cls_list.append(float(consist_pred['Cls'].cpu()))
+        print(f"Factor={factor:.4f}, Step={model.module.dino_step:.4f}")
+        print(consist_pred)
+    from matplotlib import pyplot as plt
+    joint_score = np.sqrt(np.array(loc_list) * np.array(cls_list))
+    plt.scatter(data_x, np.array(loc_list))
+    plt.scatter(data_x, np.array(cls_list))
+    plt.scatter(data_x, joint_score)
+    plt.savefig('test_stability.jpg')
+    print(find_elbow_point(data_x, joint_score),)
+    # plt.scatter()
+    # 绘制折线图
+    model.module.dino_factor.data = old_factor
 # Teaching
 def teaching(model_stu, device):
     start_time = time.time()
     # Build dataloaders
-    target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train')
+    target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train_pseudo' if  args.use_extra_pseudo_label else 'train')
     val_loader = build_dataloader(args, args.target_dataset, 'target', 'val', val_trans)
     idx_to_class = val_loader.dataset.coco.cats
     # Build teacher model
@@ -397,40 +348,39 @@ def teaching(model_stu, device):
 
     # Initialize masking
     masking = Masking(block_size=args.block_size, masked_ratio=args.masked_ratio)
-    test_samples = sample_random_samples(target_loader, device)
     #Initialize dino factors
     # if args.enable_dino:
         # model_stu.module.dino_factor.data = 0.0
         # model_tch.module.dino_factor.data = 0.0
         # model_stu.module.dino_step = 0.05
         # model_tch.module.dino_step = 0.05
-
     import math
+    if is_main_process() and args.test_stability:
+        i = 0
+        test_samples = []
+        for sample in target_loader:
+            if i == 20:
+                break
+            target_images, target_masks, target_labels = sample
+            target_teacher_images, target_student_images = target_images[0], target_images[1]
+            test_samples.append([target_teacher_images, target_masks])
+            i+=1
+        stab_factor = test_stability(model_tch, test_samples, stability_target=0.7, iter_num=11)
     if args.enable_dino:
-        pass
-    # init_out = infer_model(model_tch, test_samples)
-    # stab_factor = binary_search(model_tch, test_samples, init_out, stability_target=0.7)
+        phase = 10
+        # if epoch<phase:
+        model_tch.module.dino_factor.data = torch.tensor(args.dino_weight).cuda()     
+            # model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
+            # model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
+            # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
+            # torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
 
+        model_stu.module.dino_factor.data = model_tch.module.dino_factor.data.clone().detach()
+        init_model_stu.module.dino_factor.data = model_tch.module.dino_factor.data.clone().detach()
     for epoch in range(args.epoch):
-        if args.circulum_aug:
-            mapping_rules = {
-                (0, 5): 0,
-                (6, 10): 1,
-                (11, 100): 2,
-            }
-            aug_level = range_mapping(epoch)
-            target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train', aug_level)
 
         print('dynamic updating teacher dino weight')
-        if args.enable_dino:
-            phase = 10
-            if epoch<phase:
-                model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
-                # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
-                # torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
 
-            model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
-            init_model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
         #adaptive adjusting teacher dino factor
         # dino_factor =self_consistency_update(model_tch, test_samples)
         # model_tch.module.dino_factor.data = dino_factor
@@ -442,6 +392,8 @@ def teaching(model_stu, device):
         # Set the epoch for the sampler
         if args.distributed and hasattr(target_loader.sampler, 'set_epoch'):
             target_loader.sampler.set_epoch(epoch)
+        
+    
         if args.mode == "teaching_mask":
             loss_train, loss_target_dict = train_one_epoch_teaching_mask(
                 student_model=model_stu,
@@ -486,7 +438,8 @@ def teaching(model_stu, device):
                 print_freq=args.print_freq,
                 flush=args.flush,
                 fix_update_iter=args.fix_update_iter,
-                test_samples = test_samples, 
+                static_teacher_model=None,
+                use_extra_pseudo_label = args.use_extra_pseudo_label if epoch<2 else False
             )
         else:
             raise ValueError('Invalid mode: ' + args.mode)
@@ -581,6 +534,7 @@ def main():
     # Build model
     device = torch.device(args.device)
     model = build_model(args, device)
+
     if args.resume != "":
         model = resume_and_load(model, args.resume, device)
     # Training or evaluation

@@ -92,6 +92,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                                       fix_update_iter: int = 1,
                                       test_samples = [],
                                       static_teacher_model = None,
+                                      use_extra_pseudo_label = False,
                                       ):
     """
     Train the student model with the teacher model, using only unlabeled training set target .
@@ -101,7 +102,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
     teacher_model.train()
     criterion_pseudo.train()
     target_fetcher = DataPreFetcher(target_loader, device=device)
-    target_images, target_masks, _ = target_fetcher.next()
+    target_images, target_masks, target_labels = target_fetcher.next()
     target_teacher_images, target_student_images = target_images[0], target_images[1]
     # Record epoch losses
     epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
@@ -112,10 +113,17 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
 
 
     for iter in range(total_iters):
+        # from models.vis_tools import visualize_grad_cam
+        # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=0)
+        # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=1)
+        # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=2)
+
         # Target teacher forward
         # progressive updating weight factor
         # alpha = 0.
         import math
+        from models.vis_tools import vis_output
+
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
@@ -123,6 +131,16 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                 static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
                 static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
                 pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+            # vis_output(pseudo_labels, target_images[0], 'test_pseudo_gt.jpg')
+            # import pdb;pdb.set_trace()
+            if use_extra_pseudo_label:
+                target_labels[0]['scores'] = torch.ones_like(target_labels[0]['labels']).float() * 0.35
+                target_labels[0]['labels'] = target_labels[0]['labels']
+                pseudo_labels = merge_pseudo_labels(pseudo_labels, target_labels, iou_threshold = 0.5)
+                if torch.rand(1) < 0.01 :
+                    vis_output(target_labels, target_images[0], 'test_pseudo_gt.jpg')
+                    vis_output(pseudo_labels, target_images[0], 'test_full_pseudo_gt.jpg')
+
         # Target student forward
         target_student_out = student_model(target_student_images, target_masks)
         target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
@@ -151,7 +169,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                 teacher_model.load_state_dict(state_dict)
 
         # Data pre-fetch
-        target_images, target_masks, _ = target_fetcher.next()
+        target_images, target_masks, target_labels = target_fetcher.next()
         if target_images is not None:
             target_teacher_images, target_student_images = target_images[0], target_images[1]
 
@@ -417,6 +435,7 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
     target_teacher_images, target_student_images = target_images[0], target_images[1]
     # Record epoch losses
     epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+
 
     # Training data statistics
     epoch_target_loss_dict = defaultdict(float)
@@ -1075,6 +1094,15 @@ def train_one_epoch_teaching_mask_with_piece_distill(student_model: torch.nn.Mod
           ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
     return epoch_loss, epoch_target_loss_dict, target_fetcher
 
+def truncated_normal(mean, std, low, high, device):
+    from torch.distributions import Normal
+    """使用截断正态分布"""
+    dist = Normal(mean, std)
+    # 应用截断约束
+    sample = dist.sample().to(device)  # 使用重参数化采样
+    # 硬截断（可能会改变分布形状）
+    return torch.clamp(sample, low, high)
+
 def train_one_epoch_teaching_mask_distill(student_model: torch.nn.Module,
                                   teacher_model: torch.nn.Module,
                                   init_student_model: torch.nn.Module,
@@ -1131,11 +1159,22 @@ def train_one_epoch_teaching_mask_distill(student_model: torch.nn.Module,
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
-            static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
-            static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
-            pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+            # static teacher modeling
+            # static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+            # static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+            # pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
             # pseudo_labels = static_pseudo_labels
 
+            # unstable teacher
+            if teacher_model is not None:
+                old_factor = teacher_model.module.dino_factor.data
+                new_factor = truncated_normal(mean=float(old_factor), std=0.1, low =0, high=1.0, device=student_model.module.dino_factor.device)
+                # teacher_model.module.dino_factor = torch.tensor(0.2).cuda()
+                teacher_model.module.dino_factor.data = new_factor
+                static_teacher_out = teacher_model(target_teacher_images, target_masks)
+                static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+                pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+                teacher_model.module.dino_factor.data = old_factor
         # Target student forward
         target_student_out = student_model(target_student_images, target_masks)
         # loss from pseudo labels of current teacher

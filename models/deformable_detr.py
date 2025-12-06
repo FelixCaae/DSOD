@@ -4,8 +4,11 @@ import copy
 import torch
 from torch.nn.functional import relu, interpolate
 from torch import nn
-
-
+from .grl import GradientReversal,DomainDiscriminator
+from utils.distributed_utils import is_main_process,is_dist_avail_and_initialized
+import torch.distributed as dist
+from .vis_tools import * 
+# 使用示例
 class MLP(nn.Module):
 
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
@@ -75,8 +78,6 @@ class SPAttention(nn.Module):
     def forward(self, x, y):
         sp_weight = self.sp(x)  # [B, 1, H, W]
         return y * sp_weight.expand_as(y)  # 通道权重
-
-
 class DeformableDETR(nn.Module):
 
     def __init__(self,
@@ -124,11 +125,65 @@ class DeformableDETR(nn.Module):
 
             #build projection blocks
             self.fuse_type = fuse_type
+            out_channel = 768
+            stride = [4,2,1]
             out_channels = [512,1024,2048]
-            self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
-            
+            # self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
+            self.projs = nn.ModuleList()
+            enable_norm = False
+            enable_simple_feature_pyramid = False
+            for s,c in zip(stride,out_channels):
+                if not enable_simple_feature_pyramid:
+                    self.projs.append(nn.Sequential(nn.Conv2d(out_channel, c, kernel_size=1), nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
+                    continue
+                if s == 4:
+                    self.projs.append( nn.Sequential(nn.ConvTranspose2d(out_channel, c, kernel_size=2,stride=2),
+                                     nn.GELU(),
+                                     nn.ConvTranspose2d(c, c, kernel_size=2,stride=2),
+                                     nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
+                elif s == 2:
+                    self.projs.append( nn.Sequential(nn.ConvTranspose2d(out_channel, c, kernel_size=2,stride=2),nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
+                elif s  ==1:
+                    self.projs.append( nn.Sequential(nn.Conv2d(out_channel, c, kernel_size=1),nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
+                elif s == 0.5:
+                    self.projs.append( nn.Sequential(nn.Conv2d(out_channel, 256, kernel_size=2, stride=2),nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
+            # self.inter_box_head =  nn.Linear(self.hidden_dim, self.num_classes)
+            # self.inter_class_head = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
+            if self.fuse_type == 'cat_add':
+                self.cat_projs = nn.ModuleList()
+                for c in out_channels:
+                    self.cat_projs.append(nn.Sequential(nn.Conv2d(2*c, c, kernel_size=3,padding=1), nn.GELU(), nn.Conv2d(c,c,kernel_size=3,padding=1)))
+            elif self.fuse_type == 'ch_add':
+                self.gate_block = nn.ModuleList()
+                for c in out_channels:
+                    self.gate_block.append(nn.Sequential(nn.AdaptiveMaxPool2d((1,1)), nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,c,kernel_size=1,padding=0), nn.Sigmoid()))
+            elif self.fuse_type == 'sp_ch_add':
+                self.gate_block_1 = nn.ModuleList()
+                self.gate_block_2 = nn.ModuleList()
+                for c in out_channels:
+                    self.gate_block_1.append(nn.Sequential(nn.AdaptiveMaxPool2d((1,1)), nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,c,kernel_size=1,padding=0), nn.Sigmoid()))
+                    self.gate_block_2.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
+            elif 'gate_add' in self.fuse_type:
+                self.gate_block = nn.ModuleList()
+                for c in out_channels:
+                    self.gate_block.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
+            elif self.fuse_type == 'grl_gate_add':
+                self.gate_block = nn.ModuleList()
+                for c in out_channels:
+                    self.gate_block.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
+                self.grl_block = GradientReversal()
+                # self.discriminator = DomainDiscriminator(256)
+                # self.rev_proj = nn.Sequential(nn.Conv2d(256, 256, kernel_size=1), nn.GELU(), nn.Conv2d(256,768,kernel_size=1))
+            elif self.fuse_type == 'residual_add':
+                self.gate_block = nn.ModuleList()
+                self.residual_projs = nn.ModuleList()
+                for c in out_channels:
+                    self.gate_block.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
+                for c in out_channels:
+                    self.residual_projs.append(nn.Sequential(nn.Conv2d(c, 1024, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(1024,c,kernel_size=1,padding=0)))
+                
             #maybe some fusion block
-            if self.fuse_type == 'se':
+            elif self.fuse_type == 'se':
                 self.se_blocks = nn.ModuleList([SEAttention(i) for i in out_channels])
             elif self.fuse_type == 'sp':
                 self.sp_blocks = nn.ModuleList([SPAttention(i) for i in out_channels])
@@ -136,80 +191,169 @@ class DeformableDETR(nn.Module):
                 self.fuse_blocks = nn.ModuleList([ConvBlock(i, 1024, i, 2) for i in out_channels])
 
             self.dino_transform = dino_transform
-            self.dino_factor = nn.Parameter(torch.tensor(0.01), requires_grad=False)
+            self.dino_factor = nn.Parameter(torch.tensor(0.1), requires_grad=False)
             self.dino_step = 0.01
     @torch.no_grad()
     def forward_dino(self, data, output_shape=None, keyword='image_weak', max_length=560, patch_size=14,):
         #data is an image tensor [B,C,H,W] 
         transforms = self.dino_transform
         model_dino = self.dino_backbone
-        assert max_length % patch_size == 0
         import torch.nn.functional as F
         output = []
-        h,w = data.shape[2:4]
+        #compute the target size accoding to the original aspect ratio
+        b,c,h,w = data.shape
         x = data
         if h <= w:
             s_w = max_length
             s_h = s_w * (h/w)
-            s_h = (s_h // patch_size) * patch_size
         else:
             s_h = max_length
             s_w = s_h * (w/h)
-            s_w = (s_w // patch_size) * patch_size
+        #adjust slightly to fit the patch size
+        s_h = (s_h // patch_size) * patch_size
+        s_w = (s_w // patch_size) * patch_size
         s_h, s_w = int(s_h), int(s_w)
+
+        #resize image to the target size
         x = F.interpolate(x, (s_h, s_w), mode='bilinear')
-        feat = model_dino.forward_features(x)
-        feat = feat['x_norm_patchtokens'].reshape(1, s_h//patch_size, s_w//patch_size,-1).permute(0,3,1,2)
-        if output_shape is None:
-            output_shape = s_h//patch_size, s_w//patch_size
-        feat = F.interpolate(feat, output_shape, mode='bilinear')   
+
+        #forward
+        feat_dict = model_dino.forward_features(x)
+        
+        #reshape to B,C,H,W
+        feat = feat_dict['x_norm_patchtokens'].reshape(b, s_h//patch_size, s_w//patch_size,-1).permute(0,3,1,2)
+        if output_shape is not None:
+            #reisze to outshape if given
+            feat = F.interpolate(feat, output_shape, mode='bilinear')   
         return feat
 
-    def fuse(self, features_cnn, features_dino, target_layer=1):
+    def fuse(self, features_cnn, features_dino,debug=True):
         import torch.nn.functional as F
-        dino_feats = []
-        if self.fuse_type == 'add':
-            for target_layer in range(3):
+        dino_feats = {}
+        for target_layer in range(len(features_cnn)):
+            dino_feats[f'cnn_feats_{target_layer}'] = features_cnn[target_layer]
+
+            if self.fuse_type == 'add':
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
+            elif self.fuse_type == 'adaptive_add':
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                with torch.no_grad():
+                    scale = (features_cnn[target_layer].norm(dim=1)/dino_proj_feats.norm(dim=1)).mean()
+                if is_dist_avail_and_initialized():
+                    if not isinstance(scale, torch.Tensor):
+                        raise TypeError(f"Expected tensor, got {type(scale)}")
+                    dist.all_reduce(scale, op=dist.ReduceOp.SUM)
+                scale /= dist.get_world_size()
+                if not hasattr(self, f'scale'):
+                    self.register_buffer('scale', torch.tensor([1.,1.,1.],requires_grad=False).cuda())
+                else:
+                    self.scale[target_layer] = self.scale[target_layer] * 0.99 + scale * 0.01
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * self.scale[target_layer].clone()
+
+            elif self.fuse_type == 'mul':
                 #blending
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor #* torch.exp(self.learnable_weight)
-                dino_feats.append(dino_proj_feats)
-        elif self.fuse_type == 'blending':
-            for target_layer in range(3):
+                #norm
+                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
+                # dino_feat_norm = 
+                dino_feats.update({f'cnn_feats_{target_layer}':features_cnn[target_layer],  f'dino_feats_{target_layer}':dino_proj_feats})
+                features_cnn[target_layer] = features_cnn[target_layer] * (1 + dino_proj_feats * self.dino_factor)  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
+                # dino_feats.update({f'l2_norm_{target_layer}':dino_proj_feats.norm(dim=1)})
+            elif self.fuse_type == 'grl_gate_add':
                 #blending
-                # self.projs[target_layer]
                 # import pdb;pdb.set_trace()
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * torch.exp(self.learnable_weight)
-                dino_feats.append(dino_proj_feats)
-        elif self.fuse_type == 'se':
-            for target_layer in range(3):
-                #blending
+                gate_scores = self.grl_block(self.gate_block[target_layer](dino_proj_feats)) 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores  / gate_scores.mean()
+                dino_feats[f'metric_sim_score_{target_layer}'] = gate_scores[0][0].mean()
+                # if self.train:
+                #     import torch.nn.functional as F
+                #     # grl_feats_cnn = self.grl_block(features_cnn[2])
+                #     grl_feats_cnn = features_cnn[2]
+                #     grl_feats_dino = self.grl_block(dino_proj_feats)
+                #     dis_score_cnn = self.discriminator(grl_feats_cnn.detach())
+                #     dis_score_dino = self.discriminator(grl_feats_dino)
+                #     dino_feats['dis_cnn_loss'] = F.binary_cross_entropy_with_logits(dis_score_cnn, torch.zeros_like(dis_score_cnn))
+                #     dino_feats['dis_dino_loss'] = F.binary_cross_entropy_with_logits(dis_score_dino, torch.ones_like(dis_score_cnn))
+                #     # rev_feats_dino = self.rev_proj(grl_feats_dino)
+                    # dino_feats['construct_loss'] = F.mse_loss(F.interpolate(rev_feats_dino, features_dino.shape[2:4], mode='bilinear'), features_dino)
+            elif self.fuse_type == 'gate_add':
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor   
-                features_cnn[target_layer], attn_weight = self.se_blocks[target_layer](features_cnn[target_layer], features_cnn[target_layer])
-                dino_feats.append(dino_proj_feats) 
-                # print(target_layer, attn_weight.mean())
-        elif self.fuse_type == 'sp':
-            for target_layer in range(3):
-                #blending
+                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * (self.dino_factor + gate_scores * 0.2)
+                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
+            elif self.fuse_type == 'gate_add_cnn':
                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
-                dino_proj_feats = self.sp_blocks[target_layer](features_cnn[target_layer], dino_proj_feats)
-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor    
+                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor *  ( 1 +  gate_scores)
+                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
 
-        elif self.fuse_type == 'attn':
-            B,C,H,W = features_cnn[target_layer].shape
-            dino_feats_proj = self.proj(features_dino)
-            query = features_cnn[target_layer].flatten(2).permute(2,0,1) #B,C,H,W -> HW,B,C
-            key = value = dino_feats_proj.flatten(2).permute(2,0,1)
-            attn_out = self.fuse_attn(query, key, value)[0]
-            attn_out = self.fuse_mlp(attn_out)
-            # import pdb;pdb.set_trace()
-            attn_out = self.fuse_ln(value + attn_out)
-            attn_out = attn_out.permute(1,2,0).view(B,C,H,W)
-            features_cnn[target_layer] = features_cnn[target_layer] + attn_out * self.dino_factor
-        else:
-            raise  NotImplementedError
+            elif self.fuse_type == 'impr_gate_add':
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores / gate_scores.mean()
+                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
+            elif self.fuse_type == 'ch_add':
+                #blending
+                # import pdb;pdb.set_trace()
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                #norm
+                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
+                # dino_feat_norm = 
+                # cat_feats = torch.cat([features_cnn[target_layer], residual_feats],dim=1) #* self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
+                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores /gate_scores.mean()
+            elif self.fuse_type == 'sp_ch_add':
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                gate_scores_1 = self.gate_block_1[target_layer](dino_proj_feats) 
+                gate_scores_1 = gate_scores_1/ gate_scores_1.mean()
+                gate_scores_2 = self.gate_block_2[target_layer](dino_proj_feats)
+                gate_scores_2 = gate_scores_2 /gate_scores_2.mean()
+                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores_1 * gate_scores_2
+            elif self.fuse_type == 'residual_add':
+                #blending
+                # import pdb;pdb.set_trace()
+                cnn_proj_feats =  (features_cnn[target_layer])
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), cnn_proj_feats.shape[2:4], mode='bilinear') 
+                residual_feats = dino_proj_feats - cnn_proj_feats
+                residual_feats_proj = self.residual_projs[target_layer](residual_feats)
+                #norm
+                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
+                # dino_feat_norm = 
+                # cat_feats = torch.cat([features_cnn[target_layer], residual_feats],dim=1) #* self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
+                gate_scores = self.gate_block[target_layer](residual_feats) 
+                features_cnn[target_layer] = features_cnn[target_layer] + residual_feats_proj * self.dino_factor * gate_scores
+                dino_feats[f'l2_norm_{target_layer}'] = (features_cnn[target_layer] - dino_proj_feats).norm(dim=1, p=2)
+                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
+        
+            elif self.fuse_type == 'cat_add':
+                #blending
+                # import pdb;pdb.set_trace()
+                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+                #norm
+                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
+                # dino_feat_norm = 
+                cat_feats = torch.cat([features_cnn[target_layer], dino_proj_feats],dim=1) #* self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
+                cat_feats = self.cat_projs[target_layer](cat_feats) 
+                features_cnn[target_layer] = features_cnn[target_layer] + cat_feats * self.dino_factor
+                dino_feats.append(dino_proj_feats)
+    
+            elif self.fuse_type == 'attn':
+                B,C,H,W = features_cnn[target_layer].shape
+                dino_feats_proj = self.proj(features_dino)
+                query = features_cnn[target_layer].flatten(2).permute(2,0,1) #B,C,H,W -> HW,B,C
+                key = value = dino_feats_proj.flatten(2).permute(2,0,1)
+                attn_out = self.fuse_attn(query, key, value)[0]
+                attn_out = self.fuse_mlp(attn_out)
+                # import pdb;pdb.set_trace()
+                attn_out = self.fuse_ln(value + attn_out)
+                attn_out = attn_out.permute(1,2,0).view(B,C,H,W)
+                features_cnn[target_layer] = features_cnn[target_layer] + attn_out * self.dino_factor
+            else:
+                raise  NotImplementedError
+            dino_feats[f'dino_feats_{target_layer}'] = dino_proj_feats
+            
         return features_cnn, dino_feats
 
     def _build_input_projections(self):
@@ -251,15 +395,61 @@ class DeformableDETR(nn.Module):
         x1 = x.clamp(min=eps)
         x2 = (1 - x).clamp(min=eps)
         return torch.log(x1 / x2)
-
     def forward(self, images, masks):
         # Backbone forward
-        features = self.backbone(images)
+        features = self.backbone(images)  
         dino_features = None
+
         if self.dino_backbone is not None:
-            target_layer = 1
-            dino_features = self.forward_dino(images, output_shape=features[target_layer].shape[2:])
-            features, dino_feats_proj = self.fuse(features, dino_features, target_layer=target_layer)
+            dino_features = self.forward_dino(images, output_shape=None, max_length = max(images.shape)//2)#features[target_layer].shape[2:])
+            #the stride of dino features should be 2 * 14 ~ 28 and is close to 32 of the CNN features
+            # with torch.no_grad():
+            #     import torch.nn.functional as F
+            #     dict_feat = {"cnn_features":features[2].cpu(), 'dino_features':F.interpolate(dino_features.cpu(), features[2].shape[2:], mode='bilinear')}
+            #     torch.save(dict_feat, f"{iter}.pth")
+                # caa_results = cca_analysis(features[0], F.interpolate(dino_features, features[0].shape[2:], mode='bilinear'), n_components=10)
+            # caa_results = cca_analysis(features[1], F.interpolate(dino_features, features[1].shape[2:], mode='bilinear'), n_components=10)
+            features, vis_dict = self.fuse(features, dino_features)
+
+            debug = False
+            if torch.rand(1)<0.00 or debug:
+                # visualize_dino_heatmaps(images, vis_dict, 0)
+                # visualize_dino_heatmaps(images, vis_dict, 1)
+                # visualize_dino_heatmaps(images, vis_dict, 2)
+
+                # visualize_pca(dino_features, images, 'pca_dino.png')
+                # visualize_feature_distribution(vis_dict['cnn_feats_0'], vis_dict['dino_feats_0'], features[0], images, 0)
+                # visualize_feature_distribution(vis_dict['cnn_feats_1'], vis_dict['dino_feats_1'], features[1], images, 1)
+                # visualize_feature_distribution(vis_dict['cnn_feats_2'], vis_dict['dino_feats_2'], features[2], images, 2)
+                # visualize_feat_diff(images,vis_dict['dino_feats_0'], vis_dict['cnn_feats_0'], 'feat_diff_0_trained.png')
+                # visualize_feat_diff(images,vis_dict['dino_feats_1'], vis_dict['cnn_feats_1'], 'feat_diff_1_trained.png')
+                # visualize_feat_diff(images,vis_dict['dino_feats_2'], vis_dict['cnn_feats_2'], 'feat_diff_2_trained.png')
+
+                # import pdb;pdb.set_trace()
+                # images is a tensor of preprocess image
+                # reverse images to original range by ImageNet standard
+                # dino_feats[f'l2_norm_{target_layer}'] = (features_cnn[target_layer] - dino_proj_feats).norm(dim=1, p=2).cpu()
+                # dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0].cpu()
+                # interpolate these two hot map and overlap it with images
+                # visualize it with plt
+                if 'sim_score_0' in vis_dict:
+                    for target_layer in range(3):
+                        visualize_heat_map(images, vis_dict[f'sim_score_{target_layer}'], f'sim_map_{target_layer}.jpg')
+                        vis_dict[f'metric_sim_score_{target_layer}'] = vis_dict[f'sim_score_{target_layer}'].mean()
+                if debug:
+                    import pdb;pdb.set_trace()
+                    pass
+
+                #compute cca score
+            with torch.no_grad():
+                import torch.nn.functional as F
+                for layer in range(3):
+                    vis_dict[f'metric_cos_fuse_cnn_{layer}'] = torch.round(F.cosine_similarity(vis_dict[f'cnn_feats_{layer}'], features[layer], dim=1).mean(),decimals=3)
+                    vis_dict[f'metric_cos_fuse_dino_{layer}'] = torch.round(F.cosine_similarity(vis_dict[f'dino_feats_{layer}'], features[layer], dim=1).mean(),decimals=3)
+                    vis_dict[f'metric_cos_cnn_dino_{layer}'] = torch.round(F.cosine_similarity(vis_dict[f'dino_feats_{layer}'],vis_dict[f'cnn_feats_{layer}'], dim=1).mean(),decimals=3)
+                    # print(vis_dict[f'metric_cos_fuse_dino_{layer}'])
+                #         print(analyze_orthogonality(vis_dict[f'cnn_feats_{layer}'].cpu(), vis_dict[f'dino_feats_{layer}'].cpu(),  features[layer].cpu()))
+                #         import pdb;pdb.set_trace()
         # Prepare input features for transformer
         src_list, mask_list = [], []
         for i, feature in enumerate(features):
@@ -273,6 +463,8 @@ class DeformableDETR(nn.Module):
                 mask = interpolate(masks[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 src_list.append(src)
                 mask_list.append(mask)
+
+
         pos_list = [self.position_encoding(src, mask) for src, mask in zip(src_list, mask_list)]
         query_embeds = self.query_embed.weight
         # Transformer forward
@@ -302,9 +494,14 @@ class DeformableDETR(nn.Module):
         }
         if self.dino_backbone is not None:
             out['dino_features'] = dino_features
-            out['dino_features_proj'] = dino_feats_proj
+            # out['dino_features_proj'] = dino_feats_proj
         if hasattr(self, 'inverse_proj'):
             out['query_embed'] = self.inverse_proj(hs)
         if hasattr(self, 'dino_factor'):
             out['dino_factor'] = self.dino_factor
+        out.update(vis_dict)
+        # out['dis_cnn_loss'] = vis_dict['dis_cnn_loss']
+        # out['dis_dino_loss'] = vis_dict['dis_dino_loss']
+        # out['']
+        # out['sim_score'] = [vis_dict['sim_score_0'], vis_dict['sim_score_1'], vis_dict['sim_score_2']]
         return out

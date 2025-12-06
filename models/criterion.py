@@ -9,7 +9,10 @@ from scipy.optimize import linear_sum_assignment
 from utils.box_utils import box_cxcywh_to_xyxy,  box_xyxy_to_cxcywh, generalized_box_iou, box_iou
 from utils.distributed_utils import is_dist_avail_and_initialized, get_world_size
 from collections import defaultdict
-
+def inverse_sigmoid(x):
+    eps = 1e-6
+    x = torch.clamp(x, eps, 1-eps)
+    return torch.log(x/(1-x))
 
 def batched_diag_iou(boxes1, boxes2, eps=1e-7):
     """
@@ -363,13 +366,66 @@ class SetCriterion(nn.Module):
                 loss_class = self.loss_class(logit_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
                 loss_boxes = self.loss_boxes(boxes_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
                 loss_giou = self.loss_giou(boxes_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
-                loss_dict["loss_class"] += loss_class
+                loss_dict["loss_class"] += loss_class 
                 loss_dict["loss_boxes"] += loss_boxes
-                loss_dict["loss_giou"] += loss_giou
+                loss_dict["loss_giou"] += loss_giou 
                 loss += self.coef_class * loss_class + self.coef_boxes * loss_boxes + self.coef_giou * loss_giou
 
         # Calculate average for all decoder layers
         loss /= num_decoder_layers
+        if 'dis_cnn_loss' in out:
+            loss = loss + out['dis_cnn_loss'] * 0.1 + out['dis_dino_loss'] * 0.1# + out['construct_loss'] * 0.1
+            loss_dict['dis_cnn_loss'] = out['dis_cnn_loss']
+            loss_dict['dis_dino_loss'] = out['dis_dino_loss']
+        enable_sim_score_loss=  True
+        if 'sim_score_0' in out and enable_sim_score_loss:
+            #compute centerness with fg box in annotations and generate a heat map 
+            #compute mse loss between sim_score and fg centerness mask
+            sim_score_loss = 0
+            anchor_area = [0.01, 0.1, 0.2]
+            temperature = 0.2
+            for layer in range(3):
+                sim_score = out[f'sim_score_{layer}']
+                targets = torch.zeros_like(sim_score) 
+                h, w = sim_score.shape
+                annots_boxes = annotations[0]['boxes'] * torch.tensor([w,h,w,h]).to(targets.device)
+                y_grid, x_grid = torch.meshgrid(
+                    torch.arange(h, device=sim_score.device, dtype=torch.float32),
+                    torch.arange(w, device=sim_score.device, dtype=torch.float32),
+                    indexing='ij'
+                )
+                #H,W,2
+                # scale = 2**(3-layer)
+                scale = 1
+                with torch.no_grad():
+                    anchor_grids = torch.stack([x_grid, y_grid], dim=-1)
+                    for cx,cy,bw,bh in annots_boxes:
+                        #compute relative scale and scale sensitive weight
+                        area = torch.sqrt((bw/w) * (bh/h))
+                        ac_area = anchor_area[layer]
+                        weight = torch.exp(-(area - ac_area)**2 / temperature**2)
+                        
+                        #compute distance
+                        dist = (anchor_grids - torch.tensor([cx, cy], device=sim_score.device, dtype=torch.float32))**2
+                        sigma_w, sigma_h = bw/scale , bh/scale
+
+                        #compute gaussian
+                        dist = -0.5 * dist / torch.tensor([sigma_w**2, sigma_h**2], device=sim_score.device, dtype=torch.float32)
+                        gaussian = torch.exp(dist.sum(dim=-1)) *  1 / math.sqrt(2*math.pi) 
+                        targets = torch.maximum(targets,gaussian)
+
+                #visualize
+                import cv2
+                # plt.imshow(targets.cpu())
+                # vis_sim = F.interpolate(targets.cpu().unsqueeze(0).unsqueeze(0), (h*4,w*4), mode='bilinear')
+                # cv2.imwrite(f'test_sim_target_{layer}.jpg', vis_sim[0][0].numpy()*255)
+
+                bce_loss = F.binary_cross_entropy_with_logits(inverse_sigmoid(sim_score), targets, reduction='none').mean()
+                # bce_loss = bce_loss[targets!=0].sum()/(targets.sum()+1e-5)
+                sim_score_loss += bce_loss
+            loss += sim_score_loss 
+            loss_dict['sim_score_loss'] = sim_score_loss / 3 / 2
+            # loss_dict['construct_loss'] = out['construct_loss']
         # for k, v in loss_dict.items():
         #     loss_dict[k] /= num_decoder_layers
         # feature_alignment_loss = F.mse_loss(out['features'][-1], out['dino_features'][-1], reduction='mean') + F.mse_loss(out['features'][-2], out['dino_features'][-2], reduction='mean') + F.mse_loss(out['features'][-3], out['dino_features'][-3], reduction='mean')
@@ -410,8 +466,8 @@ class SetCriterion(nn.Module):
                 logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
                 loss = loss + logit_mse_loss
                 loss_dict['logit_mse_loss'] = logit_mse_loss
-    
-    
+
+
         enable_feature_alignment = False
         if enable_feature_alignment and 'teacher_features' in out:
             feature_alignment_loss = F.mse_loss(out['teacher_features'][-1], out['features'][-1]) #+ F.mse_loss(out['teacher_features'][-2], out['features'][-2]) +  F.mse_loss(out['teacher_features'][-3], out['features'][-3])
@@ -432,9 +488,11 @@ class SetCriterion(nn.Module):
             loss += loss_dict['query_alignment_loss'] * 1
         if 'dino_features_proj' in out:
             loss_dict['dino_feats_proj_norm'] = out['dino_features_proj'][-1].norm(dim=1,p=2).mean()
-            
+        
+        #update metric
         if 'dino_factor' in out:
             loss_dict['dino_factor'] = out['dino_factor']
+        loss_dict.update({k:v for k,v in out.items() if 'metric' in k})
         return loss, loss_dict
 
 
@@ -517,38 +575,22 @@ def merge_pseudo_labels(pseudo_labels_0, pseudo_labels_1, iou_threshold=0.7, wei
     #iter through batch
     for labels_0, labels_1 in zip(pseudo_labels_0, pseudo_labels_1):
         # Combine detections from both sets
-        boxes_list = [box_cxcywh_to_xyxy(labels_0['boxes']).cpu().numpy(), box_cxcywh_to_xyxy(labels_1['boxes'].cpu()).numpy().tolist()]
-        scores_list = [labels_0['scores'].cpu().numpy(), labels_1['scores'].cpu().numpy().tolist()]
-        labels_list = [labels_0['labels'].cpu().numpy(), labels_1['labels'].cpu().numpy().tolist()]
         if fuse_type == 'nms':
-            boxes, scores, labels = nms(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_threshold)
+            boxes_list = box_cxcywh_to_xyxy(torch.cat([labels_0['boxes'], labels_1['boxes']], dim=0)).cpu()
+            scores_list = torch.cat([labels_0['scores'], labels_1['scores']], dim=0).cpu()
+            labels_list = torch.cat([labels_0['labels'], labels_1['labels']], dim=0).cpu()
+            # boxes, scores, labels = nms(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_threshold)
+            from torchvision.ops import batched_nms
+            keep_idx = batched_nms(boxes_list, scores_list, labels_list, iou_threshold=iou_threshold)
+            boxes = boxes_list[keep_idx]
+            scores = scores_list[keep_idx]
+            labels = labels_list[keep_idx]
         elif fuse_type == 'wbf':
             boxes, scores, labels = weighted_boxes_fusion(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_thr, skip_box_thr=skip_box_thr)
-
-        # all_scores = torch.cat([labels_0['scores'], labels_1['scores']])
-        # all_labels = torch.cat([labels_0['labels'], labels_1['labels']])
-        # all_boxes = torch.cat([labels_0['boxes'], labels_1['boxes']])
-
-        # # If no boxes, return empty result
-        # if len(all_boxes) == 0:
-        #     return pseudo_labels_0
-        #     print('zero boxes! warning!')
-        #     merged_labels.append({'scores': torch.tensor([]).to(all_boxes.device),
-        #                          'labels': torch.tensor([], dtype=torch.long).to(all_boxes.device),
-        #                          'boxes': torch.zeros(0,4).to(all_boxes.device)})
-        #     continue
-        # # Apply NMS to merge overlapping boxes
-        # boxes_xyxy = box_cxcywh_to_xyxy(all_boxes)
-        # keep_indices = batched_nms(boxes_xyxy, all_scores, all_labels, iou_threshold=0.7)
-        
-        # # Select the kept detections
-        # merged_scores = all_scores[keep_indices]
-        # merged_labels_tensor = all_labels[keep_indices]
-        # merged_boxes = all_boxes[keep_indices]
         merged_labels.append({
-            'scores': torch.tensor(scores).cuda().float(),
-            'labels': torch.tensor(labels).cuda().long(),
-            'boxes': box_xyxy_to_cxcywh(torch.tensor(boxes).cuda().float())
+            'scores': (scores).cuda().float(),
+            'labels': (labels).cuda().long(),
+            'boxes': box_xyxy_to_cxcywh((boxes).cuda().float())
         })
     # print(merged_labels)
     return merged_labels

@@ -9,10 +9,11 @@ class CocoStyleDataset(CocoDetection):
 
     img_dirs = {
         'cityscapes': {
-            'train': 'cityscapes/leftImg8bit/train', 'val': 'cityscapes/leftImg8bit/val'
+            'train': 'cityscapes/leftImg8bit/train', 'val': 'cityscapes/leftImg8bit/val',
+            'train_pseudo':  'cityscapes/leftImg8bit/train', 
         },
         'foggy_cityscapes': {
-            'train': 'foggy_cityscapes/leftImg8bit_foggy/train', 'val': 'foggy_cityscapes/leftImg8bit_foggy/val'
+            'train': 'foggy_cityscapes/leftImg8bit_foggy/train', 'val': 'foggy_cityscapes/leftImg8bit_foggy/val', 'train_pseudo': 'foggy_cityscapes/leftImg8bit_foggy/train',
         },
         'bdd100k': {
             'train': 'bdd100k/images/100k/train', 'val': 'bdd100k/images/100k/val',
@@ -35,6 +36,7 @@ class CocoStyleDataset(CocoDetection):
         'foggy_cityscapes': {
             'target': {
                 'train': 'foggy_cityscapes/annotations/foggy_cityscapes_train_cocostyle.json',
+                'train_pseudo' : 'foggy_cityscapes/annotations/foggy_cityscapes_train_cocostyle_gd.json',
                 'val': 'foggy_cityscapes/annotations/foggy_cityscapes_val_cocostyle.json'
             }
         },

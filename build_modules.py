@@ -67,6 +67,9 @@ def load_dinov2(dino_repo ='dinov2',model_type="dinov2_vitb14_reg", checkpoint_p
 def build_model(args, device):
     if args.backbone == 'resnet50':
         backbone = ResNet50MultiScale()
+        # backbone = ResNet50MultiScaleInject(
+        # injection_layers=['layer2'],
+        # injection_channels={'layer2':768},)
     elif args.backbone == 'resnet18':
         backbone = ResNet18MultiScale()
     elif args.backbone == 'resnet101':
