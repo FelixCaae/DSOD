@@ -63,7 +63,105 @@ def load_dinov2(dino_repo ='dinov2',model_type="dinov2_vitb14_reg", checkpoint_p
     transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 正则化
     ])
+
+    for param in dino.parameters():
+        param.requires_grad = False
     return dino, transform
+def load_clip_visual(model_type="ViT-B/16", checkpoint_path="./weights/clip_vitb16.pth"):
+    import clip
+    model, preprocess = clip.load(model_type, device="cuda")
+    # if checkpoint_path is not None:
+    #     checkpoint = torch.load(checkpoint_path, map_location="cuda")
+    #     model.load_state_dict(checkpoint)
+    transform = preprocess.transforms[-1]  # 获取CLIP的归一化变换
+    for param in model.parameters():
+        param.requires_grad = False
+    return model.visual.float(), transform
+def load_sam_visual_encoder(
+    sam_checkpoint=None,
+    model_type="vit_l", 
+    device="cuda",
+    freeze=True,
+    output_stride=16
+):
+    """
+    专门加载SAM的视觉编码器（图像编码器）
+    
+    Args:
+        sam_checkpoint: SAM权重文件路径
+        model_type: 模型类型 ["vit_h", "vit_l", "vit_b"]
+        device: 运行设备
+        freeze: 是否冻结参数
+        output_stride: 输出步长（影响特征图尺寸）
+    
+    Returns:
+        image_encoder: SAM图像编码器
+        transform: 对应的预处理变换
+    """
+    import os
+    from segment_anything import sam_model_registry
+    # 设置默认权重路径
+    if sam_checkpoint is None:
+        checkpoint_map = {
+            "vit_h": "sam_vit_h_4b8939.pth",
+            "vit_l": "sam_vit_l_0b3195.pth", 
+            "vit_b": "sam_vit_b_01ec64.pth"
+        }
+        default_name = checkpoint_map.get(model_type)
+        sam_checkpoint = os.path.join("./weights", default_name)
+    
+    # 检查文件是否存在
+    if not os.path.exists(sam_checkpoint):
+        raise FileNotFoundError(f"SAM权重文件不存在: {sam_checkpoint}")
+    
+    try:
+        # 加载完整SAM模型
+        sam_model = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        
+        # 提取视觉编码器
+        image_encoder = sam_model.image_encoder
+        
+        # 移动到指定设备
+        image_encoder.to(device)
+        
+        # 冻结参数
+        if freeze:
+            for param in image_encoder.parameters():
+                param.requires_grad = False
+            image_encoder.eval()
+        
+        # SAM的预处理参数
+        transform = get_sam_transform()
+        
+        print(f"成功加载SAM视觉编码器: {model_type}")
+        print(f"输入尺寸: 1024x1024")
+        print(f"输出特征维度: {get_sam_output_dim(model_type)}")
+        
+        return image_encoder.half(), transform
+        
+    except Exception as e:
+        print(f"加载SAM视觉编码器失败: {e}")
+        return None, None
+
+def get_sam_output_dim(model_type):
+    """获取SAM不同模型的输出维度"""
+    dim_map = {
+        "vit_h": 1280,
+        "vit_l": 1024, 
+        "vit_b": 768
+    }
+    return dim_map.get(model_type, 1280)
+
+def get_sam_transform():
+    """
+    SAM的标准化参数
+    SAM使用ImageNet的均值和标准差
+    """
+    from torchvision import transforms
+    return transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], 
+        std=[0.229, 0.224, 0.225]
+    )
 def build_model(args, device):
     if args.backbone == 'resnet50':
         backbone = ResNet50MultiScale()
@@ -78,10 +176,18 @@ def build_model(args, device):
         raise ValueError('Invalid args.backbone name: ' + args.backbone)
     position_encoding = PositionEncodingSine()
     if args.enable_dino:
-        dino_backbone,dino_transform = load_dinov2()
+        VFM_backbone, VFM_transform = load_dinov2()
+        VFM_channel = 768
+        # VFM_backbone_2, VFM_transform_2 = load_clip_visual("ViT-B/16")
+        # VFM_channel_2 = 768
+        VFM_backbone_2, VFM_transform_2, VFM_channel_2 = None, None, None
+        
+        # VFM_backbone,VFM_transform = load_clip_visual("ViT-L/14@336px")
+        # VFM_backbone, VFM_transform = load_sam_visual_encoder()
     else:
-        dino_backbone = None
-        dino_transform = None
+        VFM_backbone = None
+        VFM_transform = None
+        VFM_channel = None
 
     transformer = DeformableTransformer(
         hidden_dim=args.hidden_dim,
@@ -93,8 +199,12 @@ def build_model(args, device):
     )
     model = DeformableDETR(
         backbone=backbone,
-        dino_backbone = dino_backbone,
-        dino_transform = dino_transform,
+        VFM_backbone = VFM_backbone,
+        VFM_transform = VFM_transform,
+        VFM_channel = VFM_channel,
+        VFM_backbone_2 = VFM_backbone_2,
+        VFM_transform_2 = VFM_transform_2,
+        VFM_channel_2 = VFM_channel_2,
         position_encoding=position_encoding,
         transformer=transformer,
         num_classes=args.num_classes,
@@ -103,6 +213,7 @@ def build_model(args, device):
         fuse_type= args.fuse_type,
         enable_query_alignment = args.enable_query_alignment,
         enable_feature_alignment = args.enable_feature_alignment,
+        enable_encoder_alignment = args.enable_encoder_alignment,
     )
     model.to(device)
     return model
@@ -114,6 +225,7 @@ def build_criterion(args, device, only_class_loss=False, high_quality_matches=Fa
         coef_class=args.coef_class,
         coef_boxes=0.0 if only_class_loss else args.coef_boxes,
         coef_giou=0.0 if only_class_loss else args.coef_giou,
+        coef_feat = args.coef_feat,
         alpha_focal=args.alpha_focal,
         high_quality_matches=high_quality_matches,
         device=device

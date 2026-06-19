@@ -12,19 +12,16 @@ from build_modules import *
 from datasets.augmentations import train_trans, val_trans, strong_trans
 from utils import get_rank, init_distributed_mode, resume_and_load, save_ckpt, selective_reinitialize, is_main_process
 
+
 def get_args_parser(parser):
     # Model Settings
     parser.add_argument('--backbone', default='resnet50', type=str)
     ##
-    parser.add_argument('--circulum_aug', action='store_true')
     parser.add_argument('--enable_dino', action='store_true')
     parser.add_argument('--dino_alpha', type=float, default=1)
     parser.add_argument('--dino_weight', type=float, default=0.5)
-
-    parser.add_argument('--distill_dino_features', action='store_true')
     parser.add_argument('--enable_query_alignment', action='store_true')
     parser.add_argument('--enable_feature_alignment', action='store_true')
-    parser.add_argument('--enable_encoder_alignment', action='store_true')
     parser.add_argument('--fuse_type', default='add')
     ##
     parser.add_argument('--pos_encoding', default='sine', type=str)
@@ -38,7 +35,6 @@ def get_args_parser(parser):
     parser.add_argument('--num_decoder_layers', default=6, type=int)
     parser.add_argument('--feedforward_dim', default=1024, type=int)
     parser.add_argument('--dropout', default=0.0, type=float)
-    parser.add_argument('--collect_flops', action='store_true')
     # Optimization hyperparameters
     parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--eval_batch_size', default=1, type=int)
@@ -56,7 +52,6 @@ def get_args_parser(parser):
     parser.add_argument('--coef_class', default=2.0, type=float)
     parser.add_argument('--coef_boxes', default=5.0, type=float)
     parser.add_argument('--coef_giou', default=2.0, type=float)
-    parser.add_argument('--coef_feat', default=0.5, type=float)
     parser.add_argument('--alpha_focal', default=0.25, type=float)
     parser.add_argument('--alpha_ema', default=0.999, type=float)
     # Dataset parameters
@@ -75,7 +70,6 @@ def get_args_parser(parser):
     parser.add_argument('--max_update_iter', default=5, type=int)
     parser.add_argument('--use_pseudo_label_weights', action="store_true")
     parser.add_argument('--use_loss_student', action="store_true")
-    parser.add_argument('--use_extra_pseudo_label', action='store_true')
     # Dynamic threshold (DT) parameters
     parser.add_argument('--threshold', default=0.3, type=float)
     parser.add_argument('--alpha_dt', default=0.5, type=float)
@@ -95,9 +89,6 @@ def get_args_parser(parser):
     parser.add_argument('--print_freq', default=100, type=int)
     parser.add_argument('--flush', default=True, type=bool)
     parser.add_argument("--resume", default="", type=str)
-    parser.add_argument("--resume_source", default="", type=str) #used for distillation to pass original model save ckpth
-    parser.add_argument("--test_stability", action='store_true')
-    parser.add_argument("--enable_smooth", action='store_true')  
     parser.add_argument("--tag", default="", type=str)
 
 def set_random_seed(seed):
@@ -181,63 +172,100 @@ def single_domain_training(model, device):
           ' . Best mAP50: ' + str(ap50_best), flush=args.flush)
 import torch
 
+def batched_diag_iou(boxes1, boxes2, eps=1e-7):
+    """
+    计算 boxes1[i] 和 boxes2[i] 之间的 IoU（支持任意 dim >= 2，且输入为 xywh 格式）
+    
+    Args:
+        boxes1 (Tensor): (..., 4), xywh 格式
+        boxes2 (Tensor): (..., 4), xywh 格式
+        eps (float): 防止除以零的小值
+    
+    Returns:
+        Tensor: (...,) IoU 值
+    """
+    # 转换 xywh -> xyxy
+    boxes1_xyxy = torch.empty_like(boxes1)
+    boxes1_xyxy[..., 0] = boxes1[..., 0] - boxes1[..., 2] / 2  # x1 = cx - w/2
+    boxes1_xyxy[..., 1] = boxes1[..., 1] - boxes1[..., 3] / 2  # y1 = cy - h/2
+    boxes1_xyxy[..., 2] = boxes1[..., 0] + boxes1[..., 2] / 2  # x2 = cx + w/2
+    boxes1_xyxy[..., 3] = boxes1[..., 1] + boxes1[..., 3] / 2  # y2 = cy + h/2
+
+    boxes2_xyxy = torch.empty_like(boxes2)
+    boxes2_xyxy[..., 0] = boxes2[..., 0] - boxes2[..., 2] / 2
+    boxes2_xyxy[..., 1] = boxes2[..., 1] - boxes2[..., 3] / 2
+    boxes2_xyxy[..., 2] = boxes2[..., 0] + boxes2[..., 2] / 2
+    boxes2_xyxy[..., 3] = boxes2[..., 1] + boxes2[..., 3] / 2
+
+    # 计算交集区域 (broadcast 支持任意 dim)
+    x1 = torch.max(boxes1_xyxy[..., 0], boxes2_xyxy[..., 0])
+    y1 = torch.max(boxes1_xyxy[..., 1], boxes2_xyxy[..., 1])
+    x2 = torch.min(boxes1_xyxy[..., 2], boxes2_xyxy[..., 2])
+    y2 = torch.min(boxes1_xyxy[..., 3], boxes2_xyxy[..., 3])
+
+    inter_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+
+    # 计算并集区域
+    area1 = boxes1[..., 2] * boxes1[..., 3]  # w * h
+    area2 = boxes2[..., 2] * boxes2[..., 3]
+    union_area = area1 + area2 - inter_area
+
+    return inter_area / (union_area + eps)  # IoU
 @torch.no_grad()
-def infer_model(model, samples, return_raw=False):
+def infer_model(model, samples):
     # out_list = []
     cls_out_list = []
     box_out_list = []
     for target_teacher_images,target_masks in samples:
-        student_out = model(target_teacher_images.cuda(), target_masks.cuda())
-        if return_raw:
-            return student_out
+        student_out = model(target_teacher_images, target_masks)
         # variance logit
-        cls_out = student_out['logit_all'][-1][0, :, ].sigmoid()
+        cls_out = student_out['logit_all'][-1][0, :, 1:].sigmoid()
         box_out = student_out['boxes_all'][-1][0] #xywh
         # out_list.append([cls_out, box_out])
         cls_out_list.append(cls_out)
         box_out_list.append(box_out)
     return torch.stack(cls_out_list, dim=0), torch.stack(box_out_list, dim=0)
-
-    
-def caculate_stability( init_out, new_out, topk=25, target_class=None):
+def caculate_stability( init_out, new_out):
     from scipy.optimize import linear_sum_assignment
     import torchvision
     from utils.box_utils import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
-    import torch.nn.functional as F
     cls_out_init, box_out_init = init_out
     box_out_init = [box_cxcywh_to_xyxy(box) for box in box_out_init]
-    cls_out_new, box_out_new = new_out
-    box_out_new = [box_cxcywh_to_xyxy(box) for box in box_out_new]
+    eps = 1e-6
+    cls_new_out, box_new_out = new_out
+    box_new_out = [box_cxcywh_to_xyxy(box) for box in box_new_out]
 
+    # if is_main_process():
+    #     vis_output(init_out, samples, 'init')
+    #     vis_output(new_out, samples, f'test_{model_strip.dino_factor.data}')
     iou_list, cls_list = [], []
     for i in range(len(cls_out_init)):
-        if len(box_out_new[i]) == 0 or len(box_out_init[i]) == 0:
+        if len(box_new_out[i]) == 0 or len(box_out_init[i]) == 0:
             iou_list.append(0.0)
             cls_list.append(0.0)
             continue
-
-        #select top 50 instance in init cls_out
-        init_score, init_cls = cls_out_init[i].max(dim=-1)
-        if target_class == None:
-            _, topk_idx = init_score.topk(topk,0, True)
-            topk_class = init_cls[topk_idx]
-            cls_sim = 1 - ((cls_out_init[i][topk_idx, topk_class] - cls_out_new[i][topk_idx,topk_class]).abs()/ cls_out_init[i][topk_idx, topk_class]).mean()
         
-        else:
-            topk_idx = cls_out_init[i,:,target_class].topk(topk, 0, True)[1]
-            cls_sim = 1 - ((cls_out_init[i][topk_idx, target_class] - cls_out_new[i][topk_idx,target_class]).abs()/ cls_out_init[i][topk_idx, target_class]).mean()
-        
-        iou_sim = torch.diag(box_iou(box_out_init[i][topk_idx], box_out_new[i][topk_idx])[0]).mean()
         # 计算 IoU 和分类相似度
+        init_score, init_cls = cls_out_init[i].max(dim=-1)
+        new_score, new_cls = cls_new_out[i].max(dim=-1)
+        mean_score = (new_score.unsqueeze(1) + init_score.unsqueeze(0)) / 2
+        cls_sim = (new_cls.unsqueeze(1) == init_cls.unsqueeze(0)) * mean_score
+        bbox_iou = box_iou(box_new_out[i], box_out_init[i])[0] * mean_score
+        
+        # 匈牙利匹配
+        C = - (cls_sim + bbox_iou)
+        ind_i, ind_j = linear_sum_assignment(C.cpu())
+        z = mean_score[ind_i, ind_j].sum() + 1e-6
+        iou_list.append(bbox_iou[ind_i, ind_j].sum()/ z)
+        cls_list.append(cls_sim[ind_i, ind_j].sum()/z)
 
-        iou_list.append(iou_sim)
-        cls_list.append(cls_sim)
     # 综合一致性
     consist_cls_pred = torch.mean(torch.stack(cls_list))
     consist_iou_pred = torch.mean(torch.stack(iou_list))
-    consist_pred = torch.sqrt(consist_iou_pred * consist_cls_pred )
-    result = {'Loc':consist_iou_pred, 'Cls':consist_cls_pred}
-    return result
+    consist_pred = torch.sqrt(consist_iou_pred * consist_cls_pred + eps)
+    
+    print(f"Consistency: IoU={consist_iou_pred:.4f}, Cls={consist_cls_pred:.4f}")
+    return consist_pred
 def binary_search(model, samples, init_out, stability_target=0.9, search_range=[0,1], iter_num = 5, eps=1e-6):
     # 提前转换边界框格式
     # 动态调整
@@ -245,7 +273,7 @@ def binary_search(model, samples, init_out, stability_target=0.9, search_range=[
     old_factor = model.module.dino_factor.data
     for i in range(iter_num):
         model.module.dino_factor.data = torch.tensor(start_pos + end_pos).cuda() /2
-        new_out = infer_model(model, samples,)
+        new_out = infer_model(model, samples)
         consist_pred = caculate_stability(init_out, new_out)
         if consist_pred > stability_target:
             start_pos = (start_pos + end_pos) / 2
@@ -254,154 +282,97 @@ def binary_search(model, samples, init_out, stability_target=0.9, search_range=[
         print(f"Iter {i} Factor={model.module.dino_factor.data:.4f}, Step={model.module.dino_step:.4f}")
     model.module.dino_factor.data = old_factor
     return (start_pos + end_pos) / 2
-
-def find_elbow_point(factors, metrics):
-    """肘部法则：寻找曲率最大的点"""
-    # 将所有点与首尾连线比较
-    start_point = np.array([factors[0], metrics[0]])
-    end_point = np.array([factors[-1], metrics[-1]])
-    
-    max_distance = 0
-    elbow_index = 0
-    
-    for i in range(1, len(factors)-1):
-        point = np.array([factors[i], metrics[i]])
-        # 计算点到首尾连线的距离
-        distance = point_line_distance(point, start_point, end_point)
-        
-        if distance > max_distance:
-            max_distance = distance
-            elbow_index = i
-    
-    return {
-        'factor': factors[elbow_index],
-        'metric_value': metrics[elbow_index],
-        'method': 'elbow',
-        'index': elbow_index
-    }
-def point_line_distance(point, line_start, line_end):
-    """计算点到直线的距离"""
-    numerator = abs(
-        (line_end[1]-line_start[1])*point[0] - 
-        (line_end[0]-line_start[0])*point[1] + 
-        line_end[0]*line_start[1] - line_end[1]*line_start[0]
-    )
-    denominator = np.sqrt(
-        (line_end[1]-line_start[1])**2 + (line_end[0]-line_start[0])**2
-    )
-    return numerator / denominator if denominator != 0 else 0
-
-def test_confidence(model, samples, weight_0, weight_1, device):
-    # orig_weight = model.state_dict()
-    resume_and_load(model, weight_0, device)
-    out_0 = infer_model(model, samples)
-    resume_and_load(model, weight_1, device)
-    out_1 = infer_model(model, samples)
-    print(out_0[0].flatten().topk(100)[0].mean(),  out_1[0].flatten().topk(100)[0].mean())
-    
-def test_stability_simple(model, samples,  search_range, K=10,vis=True):
-    old_factor = model.dino_factor.data
-    old_type = model.fuse_type 
-    model.fuse_type = 'add' 
-    # model.dino_factor.data = torch.tensor(0.).cuda()
+def self_consistency_update(model, samples, consistency_thresh=0.9, scale=1.1):
+    new_out = infer_model(model, samples)
+    old_dino_factor = model.module.dino_factor.data
+    model.module.dino_factor.data.zero_()
     init_out = infer_model(model, samples)
-    loc_list = []
-    cls_list = []
-    data_x = search_range
-    # for layer in range(3):
-    for factor in data_x:
-        model.dino_factor.data = torch.tensor(factor).cuda()
-        new_out = infer_model(model, samples)
-        consist_pred = caculate_stability(init_out, new_out, topk=K, target_class=None)
-        loc_list.append(float(consist_pred['Loc'].cpu()))
-        cls_list.append(float(consist_pred['Cls'].cpu()))
-        # print(f"Factor={factor:.4f}, Step={model.module.dino_step:.4f}")
-    
-    loc_list = [np.clip(round(i,3),0., 1.) for i in loc_list]
-    cls_list = [np.clip(round(i,3),0., 1.) for i in cls_list]
-    joint_score = np.sqrt(np.array(loc_list) * np.array(cls_list))
-    
-    dy_dx = np.gradient(joint_score, data_x)
-    ddy_dx = np.gradient(dy_dx, data_x)
-    elbow = data_x [np.argmax(ddy_dx)]
-    # elbow = find_elbow_point(data_x, joint_score)
-    if vis:
-        print(loc_list, cls_list, joint_score)
-        from matplotlib import pyplot as plt
-        plt.scatter(data_x, np.array(loc_list), label="loc")
-        plt.scatter(data_x, np.array(cls_list), label="cls")
-        plt.scatter(data_x, np.array(joint_score), label="joint_score")
-        plt.legend()
-        plt.savefig('test_stability.png', dpi=300)
-        plt.close()
-    return elbow
+    stability_score = caculate_stability(init_out, new_out)
+    if stability_score > consistency_thresh:
+        return  old_dino_factor * scale
+    return old_dino_factor
+    # else:
+    # model.module.dino_factor.data = old_dino_factor / scale
+def vis_output(model_out, samples, prefix=""):
+    import os
+    import torch
+    from detectron2.structures import Instances
+    from detectron2.utils.visualizer import Visualizer
+    from detectron2.data import MetadataCatalog,Metadata
 
+    save_dir = 'vis_output'
+    os.makedirs(save_dir, exist_ok=True)    
+    metadata = MetadataCatalog.get("cityscape_2007_train_s")  # 注意：Cityscapes的注册名是"cityscapes"（小写）
+ # ImageNet归一化参数
+    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+    metadata  = Metadata(thing_classes=['person', 'car', 'train', 'rider', 'truck', 'motorcycle', 'bicycle', 'bus'])
+    for idx, (target_teacher_images, target_masks) in enumerate(samples):
+        with torch.no_grad():
+            # 获取图像尺寸（假设输入是 [B, C, H, W]）
+            height, width = target_teacher_images.shape[-2:]
+            instances = Instances(image_size=(height, width))
+            # 提取预测框、类别和置信度
+            out_scores, out_boxes = model_out[0][idx], model_out[1][idx]
+            pred_boxes = out_boxes.cpu() * torch.tensor([[width,height,width,height]])  # [N, 4]
+            #convert from cxcywh to xyxy
+            pred_boxes = torch.cat([pred_boxes[:,:2] - pred_boxes[:,2:]/2,  pred_boxes[:,:2] + pred_boxes[:,2:]/2], dim=1) 
+            pred_logits = out_scores.cpu()  # [N, num_classes]
+            pred_scores, pred_classes = pred_logits.max(dim=-1)  # [N], [N]
+            # 填充Instances对象
+            instances.pred_boxes = pred_boxes[pred_scores>0.3]
+            instances.scores = pred_scores[pred_scores>0.3]
+            instances.pred_classes = pred_classes[pred_scores>0.3]
+            # 可视化（假设图像是 [0,1] 归一化的）
+            image_np = target_teacher_images[0].cpu().numpy()  # [C, H, W]
+            image_np = np.transpose(image_np, (1, 2, 0))  # -> [H, W, C]
+            image_np = image_np * IMAGENET_STD.numpy() + IMAGENET_MEAN.numpy()  # 反归一化
+            image_np = np.clip(image_np * 255, 0, 255).astype("uint8")
+            #这块反归一化有点问题，因为图片是根据Image Net pretrain参数归一化的 
+            vis = Visualizer(image_np, metadata=metadata, scale=1.0)
+            vis_output = vis.draw_instance_predictions(instances.to(torch.device('cpu')))
+            # 保存结果
+            output_path = os.path.join(save_dir, f"{prefix}_pred_{idx}.png")
+            vis_output.save(output_path)
 
-def vis_model(model, samples, stability_target=0.9, search_range=[0,1], iter_num = 10, eps=1e-6):
-    from models.vis_tools import vis_output
-    start_pos, end_pos = search_range
-    old_factor = model.module.dino_factor.data
-    model.module.dino_factor.data = torch.tensor(0.).cuda()
-    init_out = infer_model(model, samples, return_raw=True)
-    loc_list = []
-    cls_list = []
-    data_x = np.linspace(search_range[0],search_range[1], iter_num)
-    # for layer in range(3):
-    for factor in data_x:
-        model.module.dino_factor.data = torch.tensor(factor).cuda()
-        new_out = infer_model(model, samples, return_raw=False)
-        scores = new_out[0][0]
-        boxes = new_out[1][0]
-        scores, labels = scores.max(dim=-1)
-        det = [{'scores': scores,  'boxes':boxes, 'labels':labels}]
-        vis_output(det, samples[0][0], save_path=f"vis_dino_factor_{factor}.png")
-    
+def sample_random_samples(dataloader, device, sample_num=10):
+    target_fetcher = DataPreFetcher(dataloader,  device=device)
+    samples = []
+    i = 0
+    sample_idx = np.random.choice(np.arange(len(dataloader)), sample_num, replace=False)
+    for i in range(len(dataloader)):
+        if i not in sample_idx:
+            continue
+        images, masks, _  = target_fetcher.next()
+        samples.append([images[1], masks])
+    return samples
+
+def js_divergence(p, q, eps=1e-10):
+    from scipy.stats import entropy
+    p = p.cpu().numpy()
+    q = q.cpu().numpy()
+    p = np.clip(p, eps, 1.0)  # 避免log(0)
+    q = np.clip(q, eps, 1.0)
+    m = 0.5 * (p + q)
+    return 0.5 * (entropy(p, m, axis=-1) + entropy(q, m, axis=-1)).mean()
+
 # Teaching
 def teaching(model_stu, device):
     start_time = time.time()
     # Build dataloaders
-    target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train_pseudo' if  args.use_extra_pseudo_label else 'train')
-    test_loader = build_dataloader(args, args.target_dataset, 'target', 'train', val_trans)
+    target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train')
     val_loader = build_dataloader(args, args.target_dataset, 'target', 'val', val_trans)
     idx_to_class = val_loader.dataset.coco.cats
     # Build teacher model
     model_tch = build_teacher(args, model_stu, device)
     # Build init student model
     init_model_stu = build_teacher(args, model_stu, device)
-    static_teacher_model = build_teacher(args, model_stu, device)
- 
     # print(init_model_stu.keys())
     # Prepare model for optimization
-    #collect test_samples 
-    test_samples_num = 100
-    K = 75
-    test_samples = []
-    i = 0
-    for sample in target_loader:
-        if i == test_samples_num:
-            break
-        target_images, target_masks, target_labels = sample
-        target_teacher_images, target_student_images = target_images[0], target_images[1]
-        test_samples.append([target_teacher_images, target_masks])
-        i+=1
-    if not 'distill' in args.mode:
-        static_teacher_model = None
-    else:
-        # test_stability(model_tch, test_samples, [0, 0.4])
-        model_stu.projs = None
-        model_stu.dino_backbone = None
-        model_tch.projs = None
-        model_tch.dino_backbone = None
-        init_model_stu.projs = None
-        init_model_stu.dino_backbone = None
-        model_stu = resume_and_load(model_stu, args.resume_source, device)
-        model_tch = resume_and_load(model_tch, args.resume_source, device)
     if args.distributed:
         model_stu = DistributedDataParallel(model_stu, device_ids=[args.gpu], find_unused_parameters=False)
         model_tch = DistributedDataParallel(model_tch, device_ids=[args.gpu])
         init_model_stu = DistributedDataParallel(init_model_stu, device_ids=[args.gpu])
-        if static_teacher_model != None:
-            static_teacher_model = DistributedDataParallel(static_teacher_model, device_ids=[args.gpu])
     # Build criterion, optimizer and lr_scheduler
     criterion = build_criterion(args, device)
     criterion_pseudo = build_criterion(args, device)
@@ -421,46 +392,33 @@ def teaching(model_stu, device):
 
     # Initialize masking
     masking = Masking(block_size=args.block_size, masked_ratio=args.masked_ratio)
+    test_samples = sample_random_samples(target_loader, device)
     #Initialize dino factors
     # if args.enable_dino:
         # model_stu.module.dino_factor.data = 0.0
         # model_tch.module.dino_factor.data = 0.0
         # model_stu.module.dino_step = 0.05
         # model_tch.module.dino_step = 0.05
+
     import math
-    elbow_dict = {}
-    if is_main_process() and args.test_stability :
-        print('准备测试稳定性')
-        print(test_stability_simple(model_tch.module, test_samples,np.linspace(0, 2, 21), K))
-
-
-    i = 0
-    # vis_model(model_tch, test_samples)
-    # stab_factor = test_stability(model_tch, test_samples, stability_target=0.7, iter_num=21)
-    # np.linspace(0,5.0,21)
-    # elbow_dict = 
-    # elbow_dict = {0: 0.4, 1: 0.4, 2: 0.4, 3: 0.4, 4: 0.4, 5: 0.4, 6: 0.4, 7: 0.4, 8: 0.4}
-    print('fitted weight dict', elbow_dict)
-
-    model_stu.module.weight_dict = elbow_dict
-    model_tch.module.weight_dict = elbow_dict
-
     if args.enable_dino:
-        phase = 10
-        # if epoch<phase:
-        model_tch.module.target_dino_factor = torch.tensor(args.dino_weight).cuda()     
-            # model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
-            # model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
-            # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
-            # torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
-        model_stu.module.target_dino_factor = model_tch.module.dino_factor.data.clone().detach()
-        init_model_stu.module.dino_factor.data = model_tch.module.dino_factor.data.clone().detach()
-        model_tch.module.dino_factor.data = torch.tensor(args.dino_weight).cuda()  
-        model_stu.module.dino_factor.data = torch.tensor(args.dino_weight).cuda()  
-        
+        pass
+    # init_out = infer_model(model_tch, test_samples)
+    # stab_factor = binary_search(model_tch, test_samples, init_out, stability_target=0.7)
     for epoch in range(args.epoch):
-
         print('dynamic updating teacher dino weight')
+        if args.enable_dino:
+            k = args.dino_alpha
+            w = args.dino_weight
+            phase = 10
+            if epoch<10:
+                model_tch.module.dino_factor.data = torch.tensor(w* ((epoch)/phase)**k).cuda()     
+            elif epoch <20:
+                model_tch.module.dino_factor.data = torch.tensor(w*(2-(epoch)/phase)**k).cuda()     
+            else:
+                model_tch.module.dino_factor.data = torch.tensor(0.0).cuda()
+            # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
+            model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
 
         #adaptive adjusting teacher dino factor
         # dino_factor =self_consistency_update(model_tch, test_samples)
@@ -468,14 +426,12 @@ def teaching(model_stu, device):
 
         #keep student same with teacher
         if is_main_process() and args.enable_dino:
-            print('stu dino factor', model_stu.module.dino_factor.data)
-            print('tch dino factor', model_tch.module.dino_factor.data)
+            print('tch dino factor', model_stu.module.dino_factor.data)
+            print('stu dino factor', model_tch.module.dino_factor.data)
         # Set the epoch for the sampler
         if args.distributed and hasattr(target_loader.sampler, 'set_epoch'):
             target_loader.sampler.set_epoch(epoch)
-        
-    
-        if args.mode == "teaching_mask" or  args.mode == "teaching_mask_distill":
+        if args.mode == "teaching_mask":
             loss_train, loss_target_dict = train_one_epoch_teaching_mask(
                 student_model=model_stu,
                 teacher_model=model_tch,
@@ -489,8 +445,6 @@ def teaching(model_stu, device):
                 alpha_ema=args.alpha_ema,
                 device=device,
                 epoch=epoch,
-                smooth_dino_factor = args.enable_smooth,
-                static_teacher_model=static_teacher_model if 'distill' in args.mode else None,
                 keep_modules=args.keep_modules,
                 clip_max_norm=args.clip_max_norm,
                 print_freq=args.print_freq,
@@ -506,7 +460,7 @@ def teaching(model_stu, device):
                 use_pseudo_label_weights=args.use_pseudo_label_weights,
                 use_loss_student=args.use_loss_student
             )
-        elif args.mode == "teaching_standard" or  args.mode == 'teaching_standard_distill':
+        elif args.mode == "teaching_standard":
             loss_train, loss_target_dict = train_one_epoch_teaching_standard(
                 student_model=model_stu,
                 teacher_model=model_tch,
@@ -521,12 +475,8 @@ def teaching(model_stu, device):
                 print_freq=args.print_freq,
                 flush=args.flush,
                 fix_update_iter=args.fix_update_iter,
-                static_teacher_model=static_teacher_model if 'distill' in args.mode else None,
-                distill_dino_features = args.distill_dino_features,
-                smooth_dino_factor = args.enable_smooth ,
-                use_extra_pseudo_label = args.use_extra_pseudo_label if epoch<2 else False
+                test_samples = test_samples, 
             )
-      
         else:
             raise ValueError('Invalid mode: ' + args.mode)
 
@@ -572,10 +522,9 @@ def teaching(model_stu, device):
             if epoch == args.epoch - 1:
                 save_ckpt(model_tch, output_dir/'model_last_tch.pth', args.distributed)
                 save_ckpt(model_stu, output_dir/'model_last_stu.pth', args.distributed)
-        if (epoch+1) % 5 == 0:
-            save_ckpt(model_tch, output_dir/f'tch_epoch{epoch:02}.pth', args.distributed)
-            save_ckpt(model_stu, output_dir/f'stu_epoch{epoch:02}.pth', args.distributed)
-        writer.flush()
+            if (epoch+1) % 5 == 0:
+                save_ckpt(model_tch, output_dir/f'tch_epoch{epoch:02}.pth', args.distributed)
+                save_ckpt(model_stu, output_dir/f'stu_epoch{epoch:02}.pth', args.distributed)
     end_time = time.time()
     total_time_str = str(datetime.timedelta(seconds=int(end_time - start_time)))
     print('Teaching finished. Time cost: ' + total_time_str + ' . Best mAP50: ' + str(ap50_best), flush=args.flush)
@@ -587,7 +536,6 @@ def eval_only(model, device):
     criterion = build_criterion(args, device)
     # Eval source or target dataset
     val_loader = build_dataloader(args, args.target_dataset, 'target', 'val', val_trans)
-        # do flops 
     ap50_per_class, epoch_loss_val, coco_data = evaluate(
         model=model,
         criterion=criterion,
@@ -602,171 +550,8 @@ def eval_only(model, device):
     print("Writing evaluation result labels to " + str(output_file))
     with open(output_file, 'w', encoding='utf-8') as fp:
         json.dump(coco_data, fp)
-        
-def vis_model(model, samples, stability_target=0.9, search_range=[0,1], iter_num = 10, eps=1e-6):
-    from models.vis_tools import vis_output
-    start_pos, end_pos = search_range
-    old_factor = model.module.dino_factor.data
-    model.module.dino_factor.data = torch.tensor(0.).cuda()
-    init_out = infer_model(model, samples, return_raw=True)
-    loc_list = []
-    cls_list = []
-    data_x = np.linspace(search_range[0],search_range[1], iter_num)
-    # for layer in range(3):
-    for factor in data_x:
-        model.module.dino_factor.data = torch.tensor(factor).cuda()
-        new_out = infer_model(model, samples, return_raw=False)
-        scores = new_out[0][0]
-        boxes = new_out[1][0]
-        scores, labels = scores.max(dim=-1)
-        det = [{'scores': scores,  'boxes':boxes, 'labels':labels}]
-        vis_output(det, samples[0][0], save_path=f"vis_dino_factor_{factor}.png")
-
-def count_trainable_vs_frozen(model):
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    total = trainable + frozen
-    
-    print(f"可训练参数: {trainable:,} ({trainable/total*100:.1f}%)")
-    print(f"冻结参数: {frozen:,} ({frozen/total*100:.1f}%)")
-    print(f"总参数: {total:,}")
-    
-    return trainable, frozen
-def get_gpu_memory_usage():
-    """获取当前GPU显存使用情况"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # 峰值显存
-        
-        print("="*50)
-        print("GPU显存使用情况:")
-        print(f"当前已分配: {allocated:.3f} GB")
-        print(f"当前已保留: {reserved:.3f} GB") 
-        print(f"峰值显存: {max_allocated:.3f} GB")
-        print("="*50)
-        
-        return allocated, reserved, max_allocated
-    else:
-        print("CUDA不可用")
-        return 0, 0, 0
-@torch.no_grad()
-def do_flop(model, data_loader, range=10):
-    from fvcore.nn import flop_count_table  # can also try flop_count_str
-    from collections import Counter
-    from fvcore.nn import FlopCountAnalysis, parameter_count_table
-    import tqdm
-    # data_loader = instantiate(cfg.dataloader.test)
-    # model = instantiate(cfg.model)
-    # model.to(cfg.train.device)
-    # DetectionCheckpointer(model).load(cfg.train.init_checkpoint)
-    # model.eval()
-
-    counts = Counter()
-    total_flops = []
-    for idx, data in zip(tqdm.trange(range), data_loader):  # noqa
-        flops = FlopCountAnalysis(model, (data[0].cuda(), data[1].cuda()))
-        if idx > 0:
-            flops.unsupported_ops_warnings(False).uncalled_modules_warnings(False)
-        counts += flops.by_operator()
-        total_flops.append(flops.total())
-    print('Total GFLOPS', np.mean(total_flops) / 1e9)
-# @torch.no_grad()
-# def test_stability_simple(model, samples, search_range, class_range=[], vis=False):
-#     old_factor = model.dino_factor.data
-#     old_type = model.fuse_type 
-#     model.fuse_type = 'add' 
-#     # model.dino_factor.data = torch.tensor(0.).cuda()
-#     init_out = infer_model(model, samples)
-#     loc_list = {i:[] for i in class_range}
-#     cls_list = {i:[] for i in class_range}
-#     data_x = search_range
-#     # for layer in range(3):    # if vis:
-#     #     from matplotlib import pyplot as plt
-#     #     plt.scatter(data_x, np.array(loc_list))
-#     #     plt.scatter(data_x, np.array(cls_list))
-#     #     plt.scatter(data_x, joint_score)
-#     #     plt.savefig('test_stability.jpg')
-#     #     plt.close()
-#     #     print(f'test class {target_class}')
-#     #     print('cls_score', find_elbow_point(data_x, cls_list),)
-#     #     print('iou_score', find_elbow_point(data_x, loc_list),)
-
-#     for factor in data_x:
-#         model.dino_factor.data = torch.tensor(factor).cuda()
-#         new_out = infer_model(model, samples)
-#         for target_class in class_range:
-#             consist_pred = caculate_stability(init_out, new_out, target_class=target_class)
-#             loc_list[target_class].append(float(consist_pred['Loc'].cpu()))
-#             cls_list[target_class].append(float(consist_pred['Cls'].cpu()))
-#         # print(f"Factor={factor:.4f}, Step={model.module.dino_step:.4f}")
-#     elbow_dict = {}
-#     for target_class in loc_list.keys():
-#         joint_score = np.sqrt(np.array(loc_list[target_class]) * np.array(cls_list[target_class]))
-#         elbow = find_elbow_point(data_x, joint_score)
-#         elbow_dict[target_class] = elbow['factor']
 
 
-#     # plt.scatter()
-#     # 绘制折线图
-#     model.fuse_type = old_type
-#     model.dino_factor.data = old_factor
-#     return elbow_dict
-@torch.no_grad()
-def demo(model, demo_dir, output_dir = 'vis_demo_out'):
-    import os
-    import cv2
-    from torchvision import transforms as T
-    images = os.listdir(demo_dir)
-    Path(output_dir).mkdir(exist_ok=True)
-    from models.vis_tools import vis_output
-    transform = T.Compose([
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 正则化
-    ])
-    times = []
-    for image_name in images:
-        print('visualize ', image_name)
-        image_path = os.path.join(demo_dir, image_name)
-        img = cv2.imread(image_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = transform(img)
-        img = img.unsqueeze(0).cuda()
-        # conduct Image Net preprocessing and convert to cuda
-        t = time.time()
-        output = model(img, torch.zeros(img.shape[2:]).unsqueeze(0).cuda())
-        times.append(time.time() - t)
-        cls_out = output['logit_all'][-1][0, :, ].sigmoid()
-        scores, labels = cls_out.max(dim=-1)
-        boxes = output['boxes_all'][-1][0] #xywh
-        vis_output([{'scores':scores, 'labels':labels, 'boxes':boxes}], img.cpu(), save_path=f'{output_dir}/{image_name}')
-    print("平均推理时间", sum(times[1:])/(len(times)-1))
-    get_gpu_memory_usage()
-def grad_cam(model, demo_dir, output_dir = 'vis_demo_out'):
-    import os
-    import cv2
-    from torchvision import transforms as T
-    images = os.listdir(demo_dir)
-    Path(output_dir + '0').mkdir(exist_ok=True)
-    Path(output_dir + '1').mkdir(exist_ok=True)
-    Path(output_dir + '2').mkdir(exist_ok=True)
-
-    from models.vis_tools import visualize_grad_cam
-    transform = T.Compose([
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 正则化
-    ])
-    for image_name in images:
-        print('visualize ', image_name)
-        image_path = os.path.join(demo_dir, image_name)
-        img = cv2.imread(image_path)
-        img = transform(img).unsqueeze(0).cuda()
-        masks =  torch.zeros(img.shape[-2:]).unsqueeze(0).cuda()
-        # conduct Image Net preprocessing and convert to cuda
-        # output = model(img.unsqueeze(0).cuda(),)
-        visualize_grad_cam(model, img, masks, save_path=os.path.join(output_dir + "0", image_name), target_class=2, target_layer_idx=0)
-        visualize_grad_cam(model, img, masks, save_path=os.path.join(output_dir + "1", image_name), target_class=2, target_layer_idx=1)
-        visualize_grad_cam(model, img, masks, save_path=os.path.join(output_dir + "2", image_name), target_class=2, target_layer_idx=2)
 def main():
     # Initialize distributed mode
     init_distributed_mode(args)
@@ -784,29 +569,16 @@ def main():
     # Build model
     device = torch.device(args.device)
     model = build_model(args, device)
-    if is_main_process() and args.collect_flops:
-        count_trainable_vs_frozen(model)
-        val_loader = build_dataloader(args, args.target_dataset, 'target', 'val', val_trans)
-        do_flop(model, val_loader)
-
-    #do flops if needed
     if args.resume != "":
         model = resume_and_load(model, args.resume, device)
-    demo_dir = 'foggy' if args.target_dataset == 'foggy_cityscapes' else 'bdd100k'
     # Training or evaluation
     print('-------------------------------------', flush=args.flush)
     if args.mode == "single_domain":
         single_domain_training(model, device)
-    elif args.mode == "teaching_standard" or args.mode == "teaching_mask" or 'distill' in args.mode:
+    elif args.mode == "teaching_standard" or args.mode == "teaching_mask":
         teaching(model, device)
     elif args.mode == 'teaching_coadaptation':
         teaching_coadaptation(model, device)
-    elif args.mode == 'demo':
-        if args.enable_dino:
-            model.dino_factor.data = torch.tensor(args.dino_weight).cuda()
-        demo(model, f'demo_dir/{demo_dir}')
-    elif args.mode == 'gradcam':
-        grad_cam(model, f'demo_dir/{demo_dir}', 'vis_gradcam_dir')
     elif args.mode == "eval":
         eval_only(model, device)
     else:

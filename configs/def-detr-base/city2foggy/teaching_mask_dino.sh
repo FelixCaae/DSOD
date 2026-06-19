@@ -1,13 +1,15 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./outputs/def-detr-base/city2foggy/teaching_mask_dino_with_sin_abs_schedule
+OUTPUT_DIR=./outputs/def-detr-base/city2foggy/teaching_mask_dino_new_smooth_feature_alignment
 
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26503 \
 --nproc_per_node=${N_GPUS} \
 main.py \
 --enable_dino \
+--enable_smooth  \
+--dino_weight 0.4 \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
@@ -24,6 +26,7 @@ main.py \
 --alpha_ema 0.999 \
 --epoch 30 \
 --epoch_lr_drop 80 \
+--enable_feature_alignment \
 --mode teaching_mask \
 --threshold 0.3 \
 --dynamic_update \

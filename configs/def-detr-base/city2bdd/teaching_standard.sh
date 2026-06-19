@@ -5,7 +5,7 @@ OUTPUT_DIR=./outputs/def-detr-base/city2bdd/teaching_standard
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26504 \
 --nproc_per_node=${N_GPUS} \
-main_v3.py \
+main.py \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
@@ -20,7 +20,7 @@ main_v3.py \
 --lr_backbone 2e-5 \
 --lr_linear_proj 2e-5 \
 --alpha_ema 0.9996 \
---epoch 5 \
+--epoch 1 \
 --epoch_lr_drop 80 \
 --mode teaching_standard \
 --threshold 0.3 \

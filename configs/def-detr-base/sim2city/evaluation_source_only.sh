@@ -14,4 +14,4 @@ CUDA_VISIBLE_DEVICES=1 python -u main.py \
 --eval_batch_size ${BATCH_SIZE} \
 --mode eval \
 --output_dir ${OUTPUT_DIR} \
---resume ./outputs/def-detr-base/sim2city/teaching_mask_dino_const/tch_epoch29.pth
+--resume ./outputs/def-detr-base/sim2city/teaching_mask_dino_with_w025_a05/model_best.pth

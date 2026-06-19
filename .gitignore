@@ -1,0 +1,66 @@
+# ---- Data / datasets ----
+dataset/
+cached_feats/
+city2bdd/
+city2foggy/
+
+# ---- Experiment outputs ----
+outputs/
+output/
+logs/
+vis_outputs/
+demo_out/
+demo_dir/
+
+# ---- Pretrained / trained weights ----
+weights/
+*.pth
+
+# ---- Archives & binary data ----
+*.zip
+*.tar.gz
+*.npy
+# mmdet distributed checkpoint shards
+*.0
+
+# ---- Annotation / dump json (large data) ----
+bdd100k_*.json
+dumped_*.json
+
+# ---- Logs & csv ----
+dru_log_*.txt
+*.csv
+
+# ---- Result images ----
+*.jpg
+*.png
+
+# ---- Python caches ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Build artifacts (Deformable DETR ops) ----
+models/ops/build/
+models/ops/dist/
+*.egg-info/
+*.so
+*.o
+.ninja_deps
+.ninja_log
+build.ninja
+
+# ---- Machine-specific symlinks (point outside the repo) ----
+dataset
+datasets/dataset
+dinov2
+weights
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+
+# ---- Re-include source files that would otherwise be ignored ----
+!requirements.txt
+!README.md

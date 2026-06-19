@@ -5,6 +5,15 @@ import copy
 def resume_and_load(model, ckpt_path, device):
     print("Loading checkpoints from", ckpt_path)
     checkpoints = torch.load(ckpt_path, map_location=device)
+    key_map = {}
+    if 'projs.0.weight' in checkpoints:
+        for key in checkpoints:
+            if 'projs' in key:
+                new_key = key[:7] +'.0' + key[7:]
+                key_map[key] = new_key
+    for key,new_key in key_map.items():
+        checkpoints[new_key] = checkpoints[key]
+    
     if 'model' in checkpoints.keys() and 'optimizer' in checkpoints.keys():
         checkpoints = convert_official_ckpt(checkpoints, model.state_dict())
     missing_keys, unexpected_keys = model.load_state_dict(checkpoints, strict=False)

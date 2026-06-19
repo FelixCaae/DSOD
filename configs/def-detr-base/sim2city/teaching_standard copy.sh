@@ -1,20 +1,19 @@
 N_GPUS=8
 BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_standard
-
- OMP_NUM_THREADS=4 torchrun \
---rdzv_endpoint localhost:26505 \
+OUTPUT_DIR=./outputs/def-detr-base/sim2city/teaching_standard
+OMP_NUM_THREADS=4 torchrun \
+--rdzv_endpoint localhost:26504 \
 --nproc_per_node=${N_GPUS} \
 main.py \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
---num_classes 9 \
+--num_classes 4 \
 --dropout 0.0 \
 --data_root ${DATA_ROOT} \
---source_dataset cityscapes \
---target_dataset foggy_cityscapes \
+--source_dataset sim10k \
+--target_dataset cityscapes \
 --batch_size ${BATCH_SIZE} \
 --eval_batch_size ${BATCH_SIZE} \
 --lr 2e-4 \
@@ -24,9 +23,7 @@ main.py \
 --epoch 10 \
 --epoch_lr_drop 80 \
 --mode teaching_standard \
---enable_smooth \
---enable_feature_alignment \
 --threshold 0.3 \
 --fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
---resume city2foggy_source_only_29_53.pth
+--resume ./sim2city_source_only_48_90.pth

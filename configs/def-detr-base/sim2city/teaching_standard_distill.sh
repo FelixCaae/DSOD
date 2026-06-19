@@ -1,17 +1,15 @@
-N_GPUS=1
-BATCH_SIZE=1
+N_GPUS=8
+BATCH_SIZE=8
 DATA_ROOT=./dataset
-OUTPUT_DIR=./outputs/def-detr-base/sim2city/teaching_mask_dino_new_smooth_alignment_v2_w01
+OUTPUT_DIR=./outputs/def-detr-base/sim2city/teaching_standard_distill_dino_init_loss_merge_w05
 
 OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
 main.py \
---dino_weight 0.2 \
+--dino_weight 0.5 \
 --dino_alpha 0.5 \
 --enable_dino \
---enable_smooth \
---enable_feature_alignment \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
@@ -26,13 +24,14 @@ main.py \
 --lr_backbone 2e-5 \
 --lr_linear_proj 2e-5 \
 --alpha_ema 0.999 \
---epoch 30 \
+--epoch 5 \
 --epoch_lr_drop 80 \
---mode teaching_mask \
+--mode teaching_standard_distill \
 --threshold 0.3 \
 --dynamic_update \
 --max_update_iter 5 \
 --only_class_loss \
 --use_pseudo_label_weights \
 --output_dir ${OUTPUT_DIR} \
---resume ./sim2city_source_only_48_90.pth
+--resume  ./outputs/def-detr-base/sim2city/teaching_mask_dino_with_w025_a05/model_best.pth \
+--resume_source  ./outputs/def-detr-base/sim2city/teaching_mask_dino_with_w025_a05/model_best.pth

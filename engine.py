@@ -85,7 +85,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                                       thresholds: List[float],
                                       alpha_ema: float,
                                       device: torch.device,
-                                      epoch: int,
+                                      epoch:int,
                                       clip_max_norm: float = 0.0,
                                       print_freq: int = 20,
                                       flush: bool = True,
@@ -93,6 +93,11 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                                       test_samples = [],
                                       static_teacher_model = None,
                                       use_extra_pseudo_label = False,
+                                      smooth_dino_factor = False,
+                                      distill_dino_features = False,
+                                      distill_weight_alpha = 0.5,
+                                      distill_weight_beta = 1.0,
+                                      debug=False,
                                       ):
     """
     Train the student model with the teacher model, using only unlabeled training set target .
@@ -110,9 +115,18 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
     # Training data statistics
     epoch_target_loss_dict = defaultdict(float)
     total_iters = len(target_loader)
-
-
+    import math
+    if smooth_dino_factor and teacher_model.module.VFM_backbone is not None:
+        target_dino_factor = float(teacher_model.module.target_dino_factor)
+        acc_iter = epoch * total_iters
+        warm_up_iters = total_iters
+        print(epoch, acc_iter, target_dino_factor)
     for iter in range(total_iters):
+        if smooth_dino_factor:
+            new_w = min(math.sqrt((iter+acc_iter)/warm_up_iters), 1) * target_dino_factor
+            teacher_model.module.dino_factor.data = torch.tensor(new_w).cuda()
+            student_model.module.dino_factor.data = torch.tensor(new_w).cuda()
+            
         # from models.vis_tools import visualize_grad_cam
         # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=0)
         # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=1)
@@ -126,11 +140,18 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
 
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
-            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds, is_nms=True)
             if static_teacher_model is not None:
                 static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
                 static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
-                pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+                # pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+                if torch.rand(1) < 0.001:
+                    vis_output(pseudo_labels, target_images[0], 'test_pseudo_gt.jpg', id_mapping=lambda x:x-1)
+                    vis_output(static_pseudo_labels, target_images[0], 'test_static_pseudo_gt.jpg', id_mapping=lambda x:x-1)
+                dino_features = static_teacher_out['dino_features']
+            else:
+                dino_features = None
+        # Target student forward
             # vis_output(pseudo_labels, target_images[0], 'test_pseudo_gt.jpg')
             # import pdb;pdb.set_trace()
             if use_extra_pseudo_label:
@@ -142,10 +163,19 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
                     vis_output(pseudo_labels, target_images[0], 'test_full_pseudo_gt.jpg')
 
         # Target student forward
-        target_student_out = student_model(target_student_images, target_masks)
+        
+        target_student_out = student_model(target_student_images, target_masks, dino_features=dino_features)
         target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
-
-        loss = target_loss
+        if static_teacher_model is not None:
+            static_target_loss, static_target_loss_dict = criterion_pseudo(target_student_out, static_pseudo_labels)
+            static_logit_loss, static_logit_distill_loss_dict = criterion_pseudo.forward_logits(target_student_out, static_teacher_out)
+            target_loss_dict.update(static_logit_distill_loss_dict)
+            target_loss_dict.update({'static_' + k:v for k,v in static_target_loss_dict.items()})
+        else:
+            static_target_loss  = 0.0
+            static_logit_loss = 0.0
+            
+        loss = target_loss  + static_target_loss * distill_weight_alpha + static_logit_loss * distill_weight_beta
 
         # Backward
         optimizer.zero_grad()
@@ -172,7 +202,9 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
         target_images, target_masks, target_labels = target_fetcher.next()
         if target_images is not None:
             target_teacher_images, target_student_images = target_images[0], target_images[1]
-
+        if debug:
+            from myutils import get_gpu_memory_usage
+            get_gpu_memory_usage()
         # Log
         if is_main_process() and (iter + 1) % print_freq == 0:
             str_out = ""
@@ -207,7 +239,11 @@ def train_one_epoch_teaching_distill_standard(student_model: torch.nn.Module,
                                       print_freq: int = 20,
                                       flush: bool = True,
                                       fix_update_iter: int = 1,
-                                      test_samples = []
+                                      test_samples = [],
+                                      smooth_dino_factor: bool = False,
+                                      acc_iter: int = 0,
+                                      warm_up_iters: int = 1,
+                                      target_dino_factor: float = 1.0
                                       ):
     """
     Train the student model with the teacher model, using only unlabeled training set target .
@@ -228,6 +264,11 @@ def train_one_epoch_teaching_distill_standard(student_model: torch.nn.Module,
 
 
     for iter in range(total_iters):
+        if smooth_dino_factor:
+            new_w = min(math.sqrt((iter+acc_iter)/warm_up_iters), 1) * target_dino_factor
+            teacher_model.module.dino_factor.data = torch.tensor(new_w).cuda()
+            student_model.module.dino_factor.data = torch.tensor(new_w).cuda()
+            
         # Target teacher forward
         # progressive updating weight factor
         # alpha = 0.
@@ -407,6 +448,7 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                                   epoch: int,
                                   keep_modules: List[str],
                                   clip_max_norm: float = 0.0,
+                                  smooth_dino_factor = False,
                                   print_freq: int = 20,
                                   masking: Masking = None,
                                   flush: bool = True,
@@ -420,6 +462,8 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                                   use_pseudo_label_weights: bool = False,
                                   static_teacher_model  =None,
                                   merge_weights=[1,1],
+                                  distill_weight_alpha = 0.5,
+                                  distill_weight_beta = 0.5,
                                   use_loss_student: bool = False):
     """
     Train the student model with the teacher model, using only unlabeled training set target (plus masked target image)
@@ -444,17 +488,25 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
     # stu_buffer_cost = []
     # stu_buffer_img = []
     # stu_buffer_mask = []
+    target_dino_factor = float(teacher_model.module.target_dino_factor)
+    acc_iter = epoch * total_iters
+    warm_up_iters = total_iters
+    import math
     for iter in range(total_iters):
         # Target teacher forward
         # progressive updating weight factor
-    
+        if smooth_dino_factor:
+            new_w = min(math.sqrt((iter+acc_iter)/warm_up_iters), 1) * target_dino_factor
+            teacher_model.module.dino_factor.data = torch.tensor(new_w).cuda()
+            student_model.module.dino_factor.data = torch.tensor(new_w).cuda()
+            init_student_model.module.dino_factor.data = torch.tensor(new_w).cuda()
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
             if static_teacher_model is not None:
                 static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
                 static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
-                pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels, weights=merge_weights)
+                # pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels, weights=merge_weights)
         # Target student forward
         target_student_out = student_model(target_student_images, target_masks)
         # loss from pseudo labels of current teacher
@@ -464,10 +516,20 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
         masked_target_images = masking(target_student_images)
         masked_target_student_out = student_model(masked_target_images, target_masks)
         # loss from pseudo labels of current teacher
-        masked_target_loss, masked_target_loss_dict = criterion_pseudo(masked_target_student_out, pseudo_labels)
-
+        masked_target_loss, masked_target_loss_dict = criterion_pseudo(masked_target_student_out, pseudo_labels, mask_loss=True)
+        if static_teacher_model is not None:
+            static_target_loss, static_target_loss_dict = criterion_pseudo(target_student_out, static_pseudo_labels)
+            static_logit_loss, static_logit_distill_loss_dict = criterion_pseudo.forward_logits(target_student_out, static_teacher_out)
+            target_loss_dict.update(static_logit_distill_loss_dict)
+            target_loss_dict.update({'static_' + k:v for k,v in static_target_loss_dict.items()})
+        else:
+            static_target_loss  = 0.0
+            static_logit_loss = 0.0
+            
+        loss = target_loss  + static_target_loss * distill_weight_alpha + static_logit_loss * distill_weight_beta
+        # loss = target_loss  + static_target_loss * distill_weight
         # Final loss
-        loss = target_loss + coef_masked_img * masked_target_loss
+        loss = loss + coef_masked_img * masked_target_loss 
 
         # Loss from pseudo labels of previous student (just testing, not used)
         # if use_loss_student:
@@ -516,7 +578,7 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
                 init_student_loss, init_student_loss_dict = criterion_pseudo_weak(target_student_out,
                                                                                     pseudo_labels_init_student, use_pseudo_label_weights)
                 masked_init_student_loss, masked_init_student_loss_dict = criterion_pseudo_weak(masked_target_student_out,
-                                                                                                  pseudo_labels_init_student, use_pseudo_label_weights)
+                                                                                                  pseudo_labels_init_student, use_pseudo_label_weights, mask_loss=True)
                 loss_init_student = init_student_loss + coef_masked_img * masked_init_student_loss
                 loss += loss_init_student
 
@@ -592,9 +654,13 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
 
         # Log
         if is_main_process() and (iter + 1) % print_freq == 0:
+            str_out = ""
+            for k,v in  target_loss_dict.items():
+                str_out+= f"{k}:{float(v)} "
+            
             print('Teaching epoch ' + str(epoch) + ' : [ ' + str(iter + 1) + '/' + str(total_iters) + ' ] ' +
-                  'total loss: ' + str(loss.detach().cpu().numpy()), flush=flush)
-
+                  'total loss: ' + str(loss.detach().cpu().numpy()) + str_out, flush=flush)
+                
     # Final process of loss dict
     epoch_loss /= total_iters
     for k, v in epoch_target_loss_dict.items():
@@ -667,11 +733,6 @@ def train_one_epoch_teaching_mask_with_piece(student_model: torch.nn.Module,
         if target_images is None or target_masks is None:
             total_iters = iter
             break
-        with torch.no_grad():
-            teacher_out = teacher_model(target_teacher_images, target_masks)
-            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
-
-        # Target teacher forward
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
@@ -1158,7 +1219,7 @@ def train_one_epoch_teaching_mask_distill(student_model: torch.nn.Module,
         # progressive updating weight factor
         with torch.no_grad():
             teacher_out = teacher_model(target_teacher_images, target_masks)
-            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+            pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds, is_nms=True)
             # static teacher modeling
             # static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
             # static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
@@ -1316,6 +1377,7 @@ def evaluate(model: torch.nn.Module,
              data_loader_val: DataLoader,
              device: torch.device,
              print_freq: int,
+             enable_nms=False,
              output_result_labels: bool = False,
              flush: bool = False):
     start_time = time.time()
@@ -1366,7 +1428,7 @@ def evaluate(model: torch.nn.Module,
                   'total loss: ' + str(loss.detach().cpu().numpy()), flush=flush)
         # mAP
         orig_image_sizes = torch.stack([anno['orig_size'] for anno in annotations], dim=0)
-        results = post_process(logit_all[-1], boxes_all[-1], orig_image_sizes, 100)
+        results = post_process(logit_all[-1], boxes_all[-1], orig_image_sizes, 100, is_nms=False)
         results = {anno['image_id'].item(): res for anno, res in zip(annotations, results)}
         evaluator.update(results)
     evaluator.synchronize_between_processes()

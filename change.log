@@ -1,0 +1,1180 @@
+diff --git a/build_modules.py b/build_modules.py
+index 195cedd..9954db2 100644
+--- a/build_modules.py
++++ b/build_modules.py
+@@ -67,6 +67,9 @@ def load_dinov2(dino_repo ='dinov2',model_type="dinov2_vitb14_reg", checkpoint_p
+ def build_model(args, device):
+     if args.backbone == 'resnet50':
+         backbone = ResNet50MultiScale()
++        # backbone = ResNet50MultiScaleInject(
++        # injection_layers=['layer2'],
++        # injection_channels={'layer2':768},)
+     elif args.backbone == 'resnet18':
+         backbone = ResNet18MultiScale()
+     elif args.backbone == 'resnet101':
+diff --git a/configs/def-detr-base/city2bdd/teaching_mask.sh b/configs/def-detr-base/city2bdd/teaching_mask.sh
+index 71c7968..2547da2 100644
+--- a/configs/def-detr-base/city2bdd/teaching_mask.sh
++++ b/configs/def-detr-base/city2bdd/teaching_mask.sh
+@@ -30,4 +30,4 @@ main.py \
+ --only_class_loss \
+ --use_pseudo_label_weights \
+ --output_dir ${OUTPUT_DIR} \
+---resume ./outputs/def-detr-base/city2bdd/teaching_mask_dino_w025/stu_epoch00_pieceid9.pth
+\ No newline at end of file
++--resume ./city2bdd_source_only_29_09.pth
+\ No newline at end of file
+diff --git a/configs/def-detr-base/city2foggy/evaluation_source_only.sh b/configs/def-detr-base/city2foggy/evaluation_source_only.sh
+index abf7d20..5b3d064 100644
+--- a/configs/def-detr-base/city2foggy/evaluation_source_only.sh
++++ b/configs/def-detr-base/city2foggy/evaluation_source_only.sh
+@@ -4,6 +4,7 @@ OUTPUT_DIR=./outputs/def-detr-base/city2foggy/source_only/evaluation
+ 
+ CUDA_VISIBLE_DEVICES=1 python -u main.py \
+ --enable_dino \
++--fuse_type gate_add \
+ --backbone resnet50 \
+ --num_encoder_layers 6 \
+ --num_decoder_layers 6 \
+@@ -14,4 +15,4 @@ CUDA_VISIBLE_DEVICES=1 python -u main.py \
+ --eval_batch_size ${BATCH_SIZE} \
+ --mode eval \
+ --output_dir ${OUTPUT_DIR} \
+---resume ./outputs/def-detr-base/city2foggy/teaching_mask_dino_nonlinear_k05_debug/model_best.pth
+\ No newline at end of file
++--resume ./city2foggy/teaching_standard_dino_gate_add_04_with_sup/model_best.pth
+\ No newline at end of file
+diff --git a/configs/def-detr-base/city2foggy/evaluation_teaching_standard_dino.sh b/configs/def-detr-base/city2foggy/evaluation_teaching_standard_dino.sh
+index 8affcf8..f96291b 100644
+--- a/configs/def-detr-base/city2foggy/evaluation_teaching_standard_dino.sh
++++ b/configs/def-detr-base/city2foggy/evaluation_teaching_standard_dino.sh
+@@ -1,5 +1,5 @@
+-BATCH_SIZE=8
+-DATA_ROOT=./data
++BATCH_SIZE=1
++DATA_ROOT=./dataset
+ OUTPUT_DIR=./outputs/def-detr-base/city2foggy/teaching_standard/evaluation
+ 
+ CUDA_VISIBLE_DEVICES=1 python -u main.py \
+@@ -14,4 +14,4 @@ CUDA_VISIBLE_DEVICES=1 python -u main.py \
+ --eval_batch_size ${BATCH_SIZE} \
+ --mode eval \
+ --output_dir ${OUTPUT_DIR} \
+---resume ${OUTPUT_DIR}/../city2foggy_teaching_standard.pth
+\ No newline at end of file
++--resume ./city2foggy_source_only_29_53.pth
+\ No newline at end of file
+diff --git a/configs/def-detr-base/city2foggy/teaching_standard_dino.sh b/configs/def-detr-base/city2foggy/teaching_standard_dino.sh
+index 489493d..9a20c7d 100644
+--- a/configs/def-detr-base/city2foggy/teaching_standard_dino.sh
++++ b/configs/def-detr-base/city2foggy/teaching_standard_dino.sh
+@@ -1,5 +1,5 @@
+-N_GPUS=8
+-BATCH_SIZE=8
++N_GPUS=1
++BATCH_SIZE=1
+ DATA_ROOT=./dataset
+ OUTPUT_DIR=./city2foggy/teaching_standard_dino_new
+ 
+@@ -13,6 +13,7 @@ main.py \
+ --num_encoder_layers 6 \
+ --num_decoder_layers 6 \
+ --num_classes 9 \
++--dino_weight 0.2 \
+ --dropout 0.0 \
+ --data_root ${DATA_ROOT} \
+ --source_dataset cityscapes \
+@@ -29,5 +30,4 @@ main.py \
+ --threshold 0.3 \
+ --fix_update_iter 1 \
+ --output_dir ${OUTPUT_DIR} \
+---resume city2foggy_source_only_29_53.pth
+---tag test_dynamic_weight
+\ No newline at end of file
++--resume ./city2foggy/teaching_standard_dino_new/model_best.pth
+\ No newline at end of file
+diff --git a/datasets/coco_style_dataset.py b/datasets/coco_style_dataset.py
+index de19b4f..7672687 100644
+--- a/datasets/coco_style_dataset.py
++++ b/datasets/coco_style_dataset.py
+@@ -9,10 +9,11 @@ class CocoStyleDataset(CocoDetection):
+ 
+     img_dirs = {
+         'cityscapes': {
+-            'train': 'cityscapes/leftImg8bit/train', 'val': 'cityscapes/leftImg8bit/val'
++            'train': 'cityscapes/leftImg8bit/train', 'val': 'cityscapes/leftImg8bit/val',
++            'train_pseudo':  'cityscapes/leftImg8bit/train', 
+         },
+         'foggy_cityscapes': {
+-            'train': 'foggy_cityscapes/leftImg8bit_foggy/train', 'val': 'foggy_cityscapes/leftImg8bit_foggy/val'
++            'train': 'foggy_cityscapes/leftImg8bit_foggy/train', 'val': 'foggy_cityscapes/leftImg8bit_foggy/val', 'train_pseudo': 'foggy_cityscapes/leftImg8bit_foggy/train',
+         },
+         'bdd100k': {
+             'train': 'bdd100k/images/100k/train', 'val': 'bdd100k/images/100k/val',
+@@ -35,6 +36,7 @@ class CocoStyleDataset(CocoDetection):
+         'foggy_cityscapes': {
+             'target': {
+                 'train': 'foggy_cityscapes/annotations/foggy_cityscapes_train_cocostyle.json',
++                'train_pseudo' : 'foggy_cityscapes/annotations/foggy_cityscapes_train_cocostyle_gd.json',
+                 'val': 'foggy_cityscapes/annotations/foggy_cityscapes_val_cocostyle.json'
+             }
+         },
+diff --git a/engine.py b/engine.py
+index dab1f45..7b31c3c 100644
+--- a/engine.py
++++ b/engine.py
+@@ -92,6 +92,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
+                                       fix_update_iter: int = 1,
+                                       test_samples = [],
+                                       static_teacher_model = None,
++                                      use_extra_pseudo_label = False,
+                                       ):
+     """
+     Train the student model with the teacher model, using only unlabeled training set target .
+@@ -101,7 +102,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
+     teacher_model.train()
+     criterion_pseudo.train()
+     target_fetcher = DataPreFetcher(target_loader, device=device)
+-    target_images, target_masks, _ = target_fetcher.next()
++    target_images, target_masks, target_labels = target_fetcher.next()
+     target_teacher_images, target_student_images = target_images[0], target_images[1]
+     # Record epoch losses
+     epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+@@ -112,10 +113,17 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
+ 
+ 
+     for iter in range(total_iters):
++        # from models.vis_tools import visualize_grad_cam
++        # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=0)
++        # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=1)
++        # visualize_grad_cam(teacher_model,  target_teacher_images, target_masks, target_layer_idx=2)
++
+         # Target teacher forward
+         # progressive updating weight factor
+         # alpha = 0.
+         import math
++        from models.vis_tools import vis_output
++
+         with torch.no_grad():
+             teacher_out = teacher_model(target_teacher_images, target_masks)
+             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+@@ -123,6 +131,16 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
+                 static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+                 static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+                 pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
++            # vis_output(pseudo_labels, target_images[0], 'test_pseudo_gt.jpg')
++            # import pdb;pdb.set_trace()
++            if use_extra_pseudo_label:
++                target_labels[0]['scores'] = torch.ones_like(target_labels[0]['labels']).float() * 0.35
++                target_labels[0]['labels'] = target_labels[0]['labels']
++                pseudo_labels = merge_pseudo_labels(pseudo_labels, target_labels, iou_threshold = 0.5)
++                if torch.rand(1) < 0.01 :
++                    vis_output(target_labels, target_images[0], 'test_pseudo_gt.jpg')
++                    vis_output(pseudo_labels, target_images[0], 'test_full_pseudo_gt.jpg')
++
+         # Target student forward
+         target_student_out = student_model(target_student_images, target_masks)
+         target_loss, target_loss_dict = criterion_pseudo(target_student_out, pseudo_labels)
+@@ -151,7 +169,7 @@ def train_one_epoch_teaching_standard(student_model: torch.nn.Module,
+                 teacher_model.load_state_dict(state_dict)
+ 
+         # Data pre-fetch
+-        target_images, target_masks, _ = target_fetcher.next()
++        target_images, target_masks, target_labels = target_fetcher.next()
+         if target_images is not None:
+             target_teacher_images, target_student_images = target_images[0], target_images[1]
+ 
+@@ -418,6 +436,7 @@ def train_one_epoch_teaching_mask(student_model: torch.nn.Module,
+     # Record epoch losses
+     epoch_loss = torch.zeros(1, dtype=torch.float, device=device, requires_grad=False)
+ 
++
+     # Training data statistics
+     epoch_target_loss_dict = defaultdict(float)
+     total_iters = len(target_loader)
+@@ -1075,6 +1094,15 @@ def train_one_epoch_teaching_mask_with_piece_distill(student_model: torch.nn.Mod
+           ' Epoch loss: ' + str(epoch_loss.detach().cpu().numpy()), flush=flush)
+     return epoch_loss, epoch_target_loss_dict, target_fetcher
+ 
++def truncated_normal(mean, std, low, high, device):
++    from torch.distributions import Normal
++    """使用截断正态分布"""
++    dist = Normal(mean, std)
++    # 应用截断约束
++    sample = dist.sample().to(device)  # 使用重参数化采样
++    # 硬截断（可能会改变分布形状）
++    return torch.clamp(sample, low, high)
++
+ def train_one_epoch_teaching_mask_distill(student_model: torch.nn.Module,
+                                   teacher_model: torch.nn.Module,
+                                   init_student_model: torch.nn.Module,
+@@ -1131,11 +1159,22 @@ def train_one_epoch_teaching_mask_distill(student_model: torch.nn.Module,
+         with torch.no_grad():
+             teacher_out = teacher_model(target_teacher_images, target_masks)
+             pseudo_labels = get_pseudo_labels(teacher_out['logit_all'][-1], teacher_out['boxes_all'][-1], thresholds)
+-            static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
+-            static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
+-            pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
++            # static teacher modeling
++            # static_teacher_out = static_teacher_model(target_teacher_images, target_masks)
++            # static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
++            # pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
+             # pseudo_labels = static_pseudo_labels
+ 
++            # unstable teacher
++            if teacher_model is not None:
++                old_factor = teacher_model.module.dino_factor.data
++                new_factor = truncated_normal(mean=float(old_factor), std=0.1, low =0, high=1.0, device=student_model.module.dino_factor.device)
++                # teacher_model.module.dino_factor = torch.tensor(0.2).cuda()
++                teacher_model.module.dino_factor.data = new_factor
++                static_teacher_out = teacher_model(target_teacher_images, target_masks)
++                static_pseudo_labels = get_pseudo_labels(static_teacher_out['logit_all'][-1], static_teacher_out['boxes_all'][-1], thresholds)
++                pseudo_labels = merge_pseudo_labels(pseudo_labels, static_pseudo_labels)
++                teacher_model.module.dino_factor.data = old_factor
+         # Target student forward
+         target_student_out = student_model(target_student_images, target_masks)
+         # loss from pseudo labels of current teacher
+diff --git a/main.py b/main.py
+index 8b9a934..52dcb35 100644
+--- a/main.py
++++ b/main.py
+@@ -70,6 +70,7 @@ def get_args_parser(parser):
+     parser.add_argument('--max_update_iter', default=5, type=int)
+     parser.add_argument('--use_pseudo_label_weights', action="store_true")
+     parser.add_argument('--use_loss_student', action="store_true")
++    parser.add_argument('--use_extra_pseudo_label', action='store_true')
+     # Dynamic threshold (DT) parameters
+     parser.add_argument('--threshold', default=0.3, type=float)
+     parser.add_argument('--alpha_dt', default=0.5, type=float)
+@@ -89,6 +90,8 @@ def get_args_parser(parser):
+     parser.add_argument('--print_freq', default=100, type=int)
+     parser.add_argument('--flush', default=True, type=bool)
+     parser.add_argument("--resume", default="", type=str)
++    parser.add_argument("--test_stability", default="", type=str)
++    
+     parser.add_argument("--tag", default="", type=str)
+ 
+ def set_random_seed(seed):
+@@ -172,45 +175,6 @@ def single_domain_training(model, device):
+           ' . Best mAP50: ' + str(ap50_best), flush=args.flush)
+ import torch
+ 
+-def batched_diag_iou(boxes1, boxes2, eps=1e-7):
+-    """
+-    计算 boxes1[i] 和 boxes2[i] 之间的 IoU（支持任意 dim >= 2，且输入为 xywh 格式）
+-    
+-    Args:
+-        boxes1 (Tensor): (..., 4), xywh 格式
+-        boxes2 (Tensor): (..., 4), xywh 格式
+-        eps (float): 防止除以零的小值
+-    
+-    Returns:
+-        Tensor: (...,) IoU 值
+-    """
+-    # 转换 xywh -> xyxy
+-    boxes1_xyxy = torch.empty_like(boxes1)
+-    boxes1_xyxy[..., 0] = boxes1[..., 0] - boxes1[..., 2] / 2  # x1 = cx - w/2
+-    boxes1_xyxy[..., 1] = boxes1[..., 1] - boxes1[..., 3] / 2  # y1 = cy - h/2
+-    boxes1_xyxy[..., 2] = boxes1[..., 0] + boxes1[..., 2] / 2  # x2 = cx + w/2
+-    boxes1_xyxy[..., 3] = boxes1[..., 1] + boxes1[..., 3] / 2  # y2 = cy + h/2
+-
+-    boxes2_xyxy = torch.empty_like(boxes2)
+-    boxes2_xyxy[..., 0] = boxes2[..., 0] - boxes2[..., 2] / 2
+-    boxes2_xyxy[..., 1] = boxes2[..., 1] - boxes2[..., 3] / 2
+-    boxes2_xyxy[..., 2] = boxes2[..., 0] + boxes2[..., 2] / 2
+-    boxes2_xyxy[..., 3] = boxes2[..., 1] + boxes2[..., 3] / 2
+-
+-    # 计算交集区域 (broadcast 支持任意 dim)
+-    x1 = torch.max(boxes1_xyxy[..., 0], boxes2_xyxy[..., 0])
+-    y1 = torch.max(boxes1_xyxy[..., 1], boxes2_xyxy[..., 1])
+-    x2 = torch.min(boxes1_xyxy[..., 2], boxes2_xyxy[..., 2])
+-    y2 = torch.min(boxes1_xyxy[..., 3], boxes2_xyxy[..., 3])
+-
+-    inter_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+-
+-    # 计算并集区域
+-    area1 = boxes1[..., 2] * boxes1[..., 3]  # w * h
+-    area2 = boxes2[..., 2] * boxes2[..., 3]
+-    union_area = area1 + area2 - inter_area
+-
+-    return inter_area / (union_area + eps)  # IoU
+ @torch.no_grad()
+ def infer_model(model, samples):
+     # out_list = []
+@@ -229,43 +193,46 @@ def caculate_stability( init_out, new_out):
+     from scipy.optimize import linear_sum_assignment
+     import torchvision
+     from utils.box_utils import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
++    import torch.nn.functional as F
+     cls_out_init, box_out_init = init_out
+     box_out_init = [box_cxcywh_to_xyxy(box) for box in box_out_init]
+-    eps = 1e-6
+-    cls_new_out, box_new_out = new_out
+-    box_new_out = [box_cxcywh_to_xyxy(box) for box in box_new_out]
++    cls_out_new, box_out_new = new_out
++    box_out_new = [box_cxcywh_to_xyxy(box) for box in box_out_new]
+ 
+-    # if is_main_process():
+-    #     vis_output(init_out, samples, 'init')
+-    #     vis_output(new_out, samples, f'test_{model_strip.dino_factor.data}')
+     iou_list, cls_list = [], []
+     for i in range(len(cls_out_init)):
+-        if len(box_new_out[i]) == 0 or len(box_out_init[i]) == 0:
++        if len(box_out_new[i]) == 0 or len(box_out_init[i]) == 0:
+             iou_list.append(0.0)
+             cls_list.append(0.0)
+             continue
+-        
+-        # 计算 IoU 和分类相似度
++
++        #select top 50 instance in init cls_out
+         init_score, init_cls = cls_out_init[i].max(dim=-1)
+-        new_score, new_cls = cls_new_out[i].max(dim=-1)
+-        mean_score = (new_score.unsqueeze(1) + init_score.unsqueeze(0)) / 2
+-        cls_sim = (new_cls.unsqueeze(1) == init_cls.unsqueeze(0)) * mean_score
+-        bbox_iou = box_iou(box_new_out[i], box_out_init[i])[0] * mean_score
++        _, topk_idx = init_score.topk(50,0, True)
+         
+-        # 匈牙利匹配
+-        C = - (cls_sim + bbox_iou)
+-        ind_i, ind_j = linear_sum_assignment(C.cpu())
+-        z = mean_score[ind_i, ind_j].sum() + 1e-6
+-        iou_list.append(bbox_iou[ind_i, ind_j].sum()/ z)
+-        cls_list.append(cls_sim[ind_i, ind_j].sum()/z)
++        cls_sim = F.cosine_similarity(cls_out_init[i][topk_idx], cls_out_new[i][topk_idx], dim=-1).mean()
++        iou_sim = torch.diag(box_iou(box_out_init[i][topk_idx], box_out_new[i][topk_idx])[0]).mean()
++        # 计算 IoU 和分类相似度
+ 
++        # init_score, init_cls = cls_out_init[i].max(dim=-1)
++        # new_score, new_cls = cls_out_new[i].max(dim=-1)
++        # mean_score = (new_score.unsqueeze(1) + init_score.unsqueeze(0)) / 2
++        # cls_sim = (new_cls.unsqueeze(1) == init_cls.unsqueeze(0)) * mean_score
++        
++        # # 匈牙利匹配
++        # C = - (cls_sim + bbox_iou)
++        # ind_i, ind_j = linear_sum_assignment(C.cpu())
++        # z = mean_score[ind_i, ind_j].sum() + 1e-6
++        # iou_list.append(bbox_iou[ind_i, ind_j].sum()/ z)
++        # cls_list.append(cls_sim[ind_i, ind_j].sum()/z)
++        iou_list.append(iou_sim)
++        cls_list.append(cls_sim)
+     # 综合一致性
+     consist_cls_pred = torch.mean(torch.stack(cls_list))
+     consist_iou_pred = torch.mean(torch.stack(iou_list))
+-    consist_pred = torch.sqrt(consist_iou_pred * consist_cls_pred + eps)
+-    
+-    print(f"Consistency: IoU={consist_iou_pred:.4f}, Cls={consist_cls_pred:.4f}")
+-    return consist_pred
++    consist_pred = torch.sqrt(consist_iou_pred * consist_cls_pred )
++    result = {'Loc':consist_iou_pred, 'Cls':consist_cls_pred}
++    return result
+ def binary_search(model, samples, init_out, stability_target=0.9, search_range=[0,1], iter_num = 5, eps=1e-6):
+     # 提前转换边界框格式
+     # 动态调整
+@@ -282,90 +249,74 @@ def binary_search(model, samples, init_out, stability_target=0.9, search_range=[
+         print(f"Iter {i} Factor={model.module.dino_factor.data:.4f}, Step={model.module.dino_step:.4f}")
+     model.module.dino_factor.data = old_factor
+     return (start_pos + end_pos) / 2
+-def self_consistency_update(model, samples, consistency_thresh=0.9, scale=1.1):
+-    new_out = infer_model(model, samples)
+-    old_dino_factor = model.module.dino_factor.data
+-    model.module.dino_factor.data.zero_()
+-    init_out = infer_model(model, samples)
+-    stability_score = caculate_stability(init_out, new_out)
+-    if stability_score > consistency_thresh:
+-        return  old_dino_factor * scale
+-    return old_dino_factor
+-    # else:
+-    # model.module.dino_factor.data = old_dino_factor / scale
+-def vis_output(model_out, samples, prefix=""):
+-    import os
+-    import torch
+-    from detectron2.structures import Instances
+-    from detectron2.utils.visualizer import Visualizer
+-    from detectron2.data import MetadataCatalog,Metadata
+-
+-    save_dir = 'vis_output'
+-    os.makedirs(save_dir, exist_ok=True)    
+-    metadata = MetadataCatalog.get("cityscape_2007_train_s")  # 注意：Cityscapes的注册名是"cityscapes"（小写）
+- # ImageNet归一化参数
+-    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+-    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+-    metadata  = Metadata(thing_classes=['person', 'car', 'train', 'rider', 'truck', 'motorcycle', 'bicycle', 'bus'])
+-    for idx, (target_teacher_images, target_masks) in enumerate(samples):
+-        with torch.no_grad():
+-            # 获取图像尺寸（假设输入是 [B, C, H, W]）
+-            height, width = target_teacher_images.shape[-2:]
+-            instances = Instances(image_size=(height, width))
+-            # 提取预测框、类别和置信度
+-            out_scores, out_boxes = model_out[0][idx], model_out[1][idx]
+-            pred_boxes = out_boxes.cpu() * torch.tensor([[width,height,width,height]])  # [N, 4]
+-            #convert from cxcywh to xyxy
+-            pred_boxes = torch.cat([pred_boxes[:,:2] - pred_boxes[:,2:]/2,  pred_boxes[:,:2] + pred_boxes[:,2:]/2], dim=1) 
+-            pred_logits = out_scores.cpu()  # [N, num_classes]
+-            pred_scores, pred_classes = pred_logits.max(dim=-1)  # [N], [N]
+-            # 填充Instances对象
+-            instances.pred_boxes = pred_boxes[pred_scores>0.3]
+-            instances.scores = pred_scores[pred_scores>0.3]
+-            instances.pred_classes = pred_classes[pred_scores>0.3]
+-            # 可视化（假设图像是 [0,1] 归一化的）
+-            image_np = target_teacher_images[0].cpu().numpy()  # [C, H, W]
+-            image_np = np.transpose(image_np, (1, 2, 0))  # -> [H, W, C]
+-            image_np = image_np * IMAGENET_STD.numpy() + IMAGENET_MEAN.numpy()  # 反归一化
+-            image_np = np.clip(image_np * 255, 0, 255).astype("uint8")
+-            #这块反归一化有点问题，因为图片是根据Image Net pretrain参数归一化的 
+-            vis = Visualizer(image_np, metadata=metadata, scale=1.0)
+-            vis_output = vis.draw_instance_predictions(instances.to(torch.device('cpu')))
+-            # 保存结果
+-            output_path = os.path.join(save_dir, f"{prefix}_pred_{idx}.png")
+-            vis_output.save(output_path)
+-
+-def sample_random_samples(dataloader, device, sample_num=10):
+-    target_fetcher = DataPreFetcher(dataloader,  device=device)
+-    samples = []
+-    i = 0
+-    sample_idx = np.random.choice(np.arange(len(dataloader)), sample_num, replace=False)
+-    for i in range(len(dataloader)):
+-        if i not in sample_idx:
+-            continue
+-        images, masks, _  = target_fetcher.next()
+-        samples.append([images[1], masks])
+-    return samples
+-
+-def js_divergence(p, q, eps=1e-10):
+-    from scipy.stats import entropy
+-    p = p.cpu().numpy()
+-    q = q.cpu().numpy()
+-    p = np.clip(p, eps, 1.0)  # 避免log(0)
+-    q = np.clip(q, eps, 1.0)
+-    m = 0.5 * (p + q)
+-    return 0.5 * (entropy(p, m, axis=-1) + entropy(q, m, axis=-1)).mean()
+-def range_mapping(value, mapping_rules):
+-    for (start, end), mapped_value in mapping_rules.items():
+-        if start <= value <= end:
+-            return mapped_value
+-    return None
+ 
++def find_elbow_point(factors, metrics):
++    """肘部法则：寻找曲率最大的点"""
++    # 将所有点与首尾连线比较
++    start_point = np.array([factors[0], metrics[0]])
++    end_point = np.array([factors[-1], metrics[-1]])
++    
++    max_distance = 0
++    elbow_index = 0
++    
++    for i in range(1, len(factors)-1):
++        point = np.array([factors[i], metrics[i]])
++        # 计算点到首尾连线的距离
++        distance = point_line_distance(point, start_point, end_point)
++        
++        if distance > max_distance:
++            max_distance = distance
++            elbow_index = i
++    
++    return {
++        'factor': factors[elbow_index],
++        'metric_value': metrics[elbow_index],
++        'method': 'elbow',
++        'index': elbow_index
++    }
++def point_line_distance(point, line_start, line_end):
++    """计算点到直线的距离"""
++    numerator = abs(
++        (line_end[1]-line_start[1])*point[0] - 
++        (line_end[0]-line_start[0])*point[1] + 
++        line_end[0]*line_start[1] - line_end[1]*line_start[0]
++    )
++    denominator = np.sqrt(
++        (line_end[1]-line_start[1])**2 + (line_end[0]-line_start[0])**2
++    )
++    return numerator / denominator if denominator != 0 else 0
++def test_stability(model, samples, stability_target=0.9, search_range=[0,1], iter_num = 10, eps=1e-6):
++    start_pos, end_pos = search_range
++    old_factor = model.module.dino_factor.data
++    model.module.dino_factor.data = torch.tensor(0.).cuda()
++    init_out = infer_model(model, samples)
++    loc_list = []
++    cls_list = []
++    data_x = np.linspace(search_range[0],search_range[1], iter_num)
++    # for layer in range(3):
++    for factor in data_x:
++        model.module.dino_factor.data = torch.tensor(factor).cuda()
++        new_out = infer_model(model, samples)
++        consist_pred = caculate_stability(init_out, new_out)
++        loc_list.append(float(consist_pred['Loc'].cpu()))
++        cls_list.append(float(consist_pred['Cls'].cpu()))
++        print(f"Factor={factor:.4f}, Step={model.module.dino_step:.4f}")
++        print(consist_pred)
++    from matplotlib import pyplot as plt
++    joint_score = np.sqrt(np.array(loc_list) * np.array(cls_list))
++    plt.scatter(data_x, np.array(loc_list))
++    plt.scatter(data_x, np.array(cls_list))
++    plt.scatter(data_x, joint_score)
++    plt.savefig('test_stability.jpg')
++    print(find_elbow_point(data_x, joint_score),)
++    # plt.scatter()
++    # 绘制折线图
++    model.module.dino_factor.data = old_factor
+ # Teaching
+ def teaching(model_stu, device):
+     start_time = time.time()
+     # Build dataloaders
+-    target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train')
++    target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train_pseudo' if  args.use_extra_pseudo_label else 'train')
+     val_loader = build_dataloader(args, args.target_dataset, 'target', 'val', val_trans)
+     idx_to_class = val_loader.dataset.coco.cats
+     # Build teacher model
+@@ -397,40 +348,39 @@ def teaching(model_stu, device):
+ 
+     # Initialize masking
+     masking = Masking(block_size=args.block_size, masked_ratio=args.masked_ratio)
+-    test_samples = sample_random_samples(target_loader, device)
+     #Initialize dino factors
+     # if args.enable_dino:
+         # model_stu.module.dino_factor.data = 0.0
+         # model_tch.module.dino_factor.data = 0.0
+         # model_stu.module.dino_step = 0.05
+         # model_tch.module.dino_step = 0.05
+-
+     import math
++    if is_main_process() and args.test_stability:
++        i = 0
++        test_samples = []
++        for sample in target_loader:
++            if i == 20:
++                break
++            target_images, target_masks, target_labels = sample
++            target_teacher_images, target_student_images = target_images[0], target_images[1]
++            test_samples.append([target_teacher_images, target_masks])
++            i+=1
++        stab_factor = test_stability(model_tch, test_samples, stability_target=0.7, iter_num=11)
+     if args.enable_dino:
+-        pass
+-    # init_out = infer_model(model_tch, test_samples)
+-    # stab_factor = binary_search(model_tch, test_samples, init_out, stability_target=0.7)
+-
++        phase = 10
++        # if epoch<phase:
++        model_tch.module.dino_factor.data = torch.tensor(args.dino_weight).cuda()     
++            # model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
++            # model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
++            # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
++            # torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
++
++        model_stu.module.dino_factor.data = model_tch.module.dino_factor.data.clone().detach()
++        init_model_stu.module.dino_factor.data = model_tch.module.dino_factor.data.clone().detach()
+     for epoch in range(args.epoch):
+-        if args.circulum_aug:
+-            mapping_rules = {
+-                (0, 5): 0,
+-                (6, 10): 1,
+-                (11, 100): 2,
+-            }
+-            aug_level = range_mapping(epoch)
+-            target_loader = build_dataloader_teaching(args, args.target_dataset, 'target', 'train', aug_level)
+ 
+         print('dynamic updating teacher dino weight')
+-        if args.enable_dino:
+-            phase = 10
+-            if epoch<phase:
+-                model_tch.module.dino_factor.data = torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
+-                # model_tch.module.dino_factor.data = torch.tensor(math.sin(epoch/10 * math.pi/2) * 0.5).cuda()
+-                # torch.tensor(args.dino_weight* ((epoch+1)/phase)**args.dino_alpha).cuda()     
+ 
+-            model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
+-            init_model_stu.module.dino_factor.data = model_tch.module.dino_factor.data
+         #adaptive adjusting teacher dino factor
+         # dino_factor =self_consistency_update(model_tch, test_samples)
+         # model_tch.module.dino_factor.data = dino_factor
+@@ -442,6 +392,8 @@ def teaching(model_stu, device):
+         # Set the epoch for the sampler
+         if args.distributed and hasattr(target_loader.sampler, 'set_epoch'):
+             target_loader.sampler.set_epoch(epoch)
++        
++    
+         if args.mode == "teaching_mask":
+             loss_train, loss_target_dict = train_one_epoch_teaching_mask(
+                 student_model=model_stu,
+@@ -486,7 +438,8 @@ def teaching(model_stu, device):
+                 print_freq=args.print_freq,
+                 flush=args.flush,
+                 fix_update_iter=args.fix_update_iter,
+-                test_samples = test_samples, 
++                static_teacher_model=None,
++                use_extra_pseudo_label = args.use_extra_pseudo_label if epoch<2 else False
+             )
+         else:
+             raise ValueError('Invalid mode: ' + args.mode)
+@@ -581,6 +534,7 @@ def main():
+     # Build model
+     device = torch.device(args.device)
+     model = build_model(args, device)
++
+     if args.resume != "":
+         model = resume_and_load(model, args.resume, device)
+     # Training or evaluation
+diff --git a/models/criterion.py b/models/criterion.py
+index 837743b..4c7c792 100644
+--- a/models/criterion.py
++++ b/models/criterion.py
+@@ -9,7 +9,10 @@ from scipy.optimize import linear_sum_assignment
+ from utils.box_utils import box_cxcywh_to_xyxy,  box_xyxy_to_cxcywh, generalized_box_iou, box_iou
+ from utils.distributed_utils import is_dist_avail_and_initialized, get_world_size
+ from collections import defaultdict
+-
++def inverse_sigmoid(x):
++    eps = 1e-6
++    x = torch.clamp(x, eps, 1-eps)
++    return torch.log(x/(1-x))
+ 
+ def batched_diag_iou(boxes1, boxes2, eps=1e-7):
+     """
+@@ -363,13 +366,66 @@ class SetCriterion(nn.Module):
+                 loss_class = self.loss_class(logit_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
+                 loss_boxes = self.loss_boxes(boxes_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
+                 loss_giou = self.loss_giou(boxes_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
+-                loss_dict["loss_class"] += loss_class
++                loss_dict["loss_class"] += loss_class 
+                 loss_dict["loss_boxes"] += loss_boxes
+-                loss_dict["loss_giou"] += loss_giou
++                loss_dict["loss_giou"] += loss_giou 
+                 loss += self.coef_class * loss_class + self.coef_boxes * loss_boxes + self.coef_giou * loss_giou
+ 
+         # Calculate average for all decoder layers
+         loss /= num_decoder_layers
++        if 'dis_cnn_loss' in out:
++            loss = loss + out['dis_cnn_loss'] * 0.1 + out['dis_dino_loss'] * 0.1# + out['construct_loss'] * 0.1
++            loss_dict['dis_cnn_loss'] = out['dis_cnn_loss']
++            loss_dict['dis_dino_loss'] = out['dis_dino_loss']
++        enable_sim_score_loss=  True
++        if 'sim_score_0' in out and enable_sim_score_loss:
++            #compute centerness with fg box in annotations and generate a heat map 
++            #compute mse loss between sim_score and fg centerness mask
++            sim_score_loss = 0
++            anchor_area = [0.01, 0.1, 0.2]
++            temperature = 0.2
++            for layer in range(3):
++                sim_score = out[f'sim_score_{layer}']
++                targets = torch.zeros_like(sim_score) 
++                h, w = sim_score.shape
++                annots_boxes = annotations[0]['boxes'] * torch.tensor([w,h,w,h]).to(targets.device)
++                y_grid, x_grid = torch.meshgrid(
++                    torch.arange(h, device=sim_score.device, dtype=torch.float32),
++                    torch.arange(w, device=sim_score.device, dtype=torch.float32),
++                    indexing='ij'
++                )
++                #H,W,2
++                # scale = 2**(3-layer)
++                scale = 1
++                with torch.no_grad():
++                    anchor_grids = torch.stack([x_grid, y_grid], dim=-1)
++                    for cx,cy,bw,bh in annots_boxes:
++                        #compute relative scale and scale sensitive weight
++                        area = torch.sqrt((bw/w) * (bh/h))
++                        ac_area = anchor_area[layer]
++                        weight = torch.exp(-(area - ac_area)**2 / temperature**2)
++                        
++                        #compute distance
++                        dist = (anchor_grids - torch.tensor([cx, cy], device=sim_score.device, dtype=torch.float32))**2
++                        sigma_w, sigma_h = bw/scale , bh/scale
++
++                        #compute gaussian
++                        dist = -0.5 * dist / torch.tensor([sigma_w**2, sigma_h**2], device=sim_score.device, dtype=torch.float32)
++                        gaussian = torch.exp(dist.sum(dim=-1)) *  1 / math.sqrt(2*math.pi) 
++                        targets = torch.maximum(targets,gaussian)
++
++                #visualize
++                import cv2
++                # plt.imshow(targets.cpu())
++                # vis_sim = F.interpolate(targets.cpu().unsqueeze(0).unsqueeze(0), (h*4,w*4), mode='bilinear')
++                # cv2.imwrite(f'test_sim_target_{layer}.jpg', vis_sim[0][0].numpy()*255)
++
++                bce_loss = F.binary_cross_entropy_with_logits(inverse_sigmoid(sim_score), targets, reduction='none').mean()
++                # bce_loss = bce_loss[targets!=0].sum()/(targets.sum()+1e-5)
++                sim_score_loss += bce_loss
++            loss += sim_score_loss 
++            loss_dict['sim_score_loss'] = sim_score_loss / 3 / 2
++            # loss_dict['construct_loss'] = out['construct_loss']
+         # for k, v in loss_dict.items():
+         #     loss_dict[k] /= num_decoder_layers
+         # feature_alignment_loss = F.mse_loss(out['features'][-1], out['dino_features'][-1], reduction='mean') + F.mse_loss(out['features'][-2], out['dino_features'][-2], reduction='mean') + F.mse_loss(out['features'][-3], out['dino_features'][-3], reduction='mean')
+@@ -410,8 +466,8 @@ class SetCriterion(nn.Module):
+                 logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
+                 loss = loss + logit_mse_loss
+                 loss_dict['logit_mse_loss'] = logit_mse_loss
+-    
+-    
++
++
+         enable_feature_alignment = False
+         if enable_feature_alignment and 'teacher_features' in out:
+             feature_alignment_loss = F.mse_loss(out['teacher_features'][-1], out['features'][-1]) #+ F.mse_loss(out['teacher_features'][-2], out['features'][-2]) +  F.mse_loss(out['teacher_features'][-3], out['features'][-3])
+@@ -432,9 +488,11 @@ class SetCriterion(nn.Module):
+             loss += loss_dict['query_alignment_loss'] * 1
+         if 'dino_features_proj' in out:
+             loss_dict['dino_feats_proj_norm'] = out['dino_features_proj'][-1].norm(dim=1,p=2).mean()
+-            
++        
++        #update metric
+         if 'dino_factor' in out:
+             loss_dict['dino_factor'] = out['dino_factor']
++        loss_dict.update({k:v for k,v in out.items() if 'metric' in k})
+         return loss, loss_dict
+ 
+ 
+@@ -517,38 +575,22 @@ def merge_pseudo_labels(pseudo_labels_0, pseudo_labels_1, iou_threshold=0.7, wei
+     #iter through batch
+     for labels_0, labels_1 in zip(pseudo_labels_0, pseudo_labels_1):
+         # Combine detections from both sets
+-        boxes_list = [box_cxcywh_to_xyxy(labels_0['boxes']).cpu().numpy(), box_cxcywh_to_xyxy(labels_1['boxes'].cpu()).numpy().tolist()]
+-        scores_list = [labels_0['scores'].cpu().numpy(), labels_1['scores'].cpu().numpy().tolist()]
+-        labels_list = [labels_0['labels'].cpu().numpy(), labels_1['labels'].cpu().numpy().tolist()]
+         if fuse_type == 'nms':
+-            boxes, scores, labels = nms(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_threshold)
++            boxes_list = box_cxcywh_to_xyxy(torch.cat([labels_0['boxes'], labels_1['boxes']], dim=0)).cpu()
++            scores_list = torch.cat([labels_0['scores'], labels_1['scores']], dim=0).cpu()
++            labels_list = torch.cat([labels_0['labels'], labels_1['labels']], dim=0).cpu()
++            # boxes, scores, labels = nms(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_threshold)
++            from torchvision.ops import batched_nms
++            keep_idx = batched_nms(boxes_list, scores_list, labels_list, iou_threshold=iou_threshold)
++            boxes = boxes_list[keep_idx]
++            scores = scores_list[keep_idx]
++            labels = labels_list[keep_idx]
+         elif fuse_type == 'wbf':
+             boxes, scores, labels = weighted_boxes_fusion(boxes_list, scores_list, labels_list, weights=weights, iou_thr=iou_thr, skip_box_thr=skip_box_thr)
+-
+-        # all_scores = torch.cat([labels_0['scores'], labels_1['scores']])
+-        # all_labels = torch.cat([labels_0['labels'], labels_1['labels']])
+-        # all_boxes = torch.cat([labels_0['boxes'], labels_1['boxes']])
+-
+-        # # If no boxes, return empty result
+-        # if len(all_boxes) == 0:
+-        #     return pseudo_labels_0
+-        #     print('zero boxes! warning!')
+-        #     merged_labels.append({'scores': torch.tensor([]).to(all_boxes.device),
+-        #                          'labels': torch.tensor([], dtype=torch.long).to(all_boxes.device),
+-        #                          'boxes': torch.zeros(0,4).to(all_boxes.device)})
+-        #     continue
+-        # # Apply NMS to merge overlapping boxes
+-        # boxes_xyxy = box_cxcywh_to_xyxy(all_boxes)
+-        # keep_indices = batched_nms(boxes_xyxy, all_scores, all_labels, iou_threshold=0.7)
+-        
+-        # # Select the kept detections
+-        # merged_scores = all_scores[keep_indices]
+-        # merged_labels_tensor = all_labels[keep_indices]
+-        # merged_boxes = all_boxes[keep_indices]
+         merged_labels.append({
+-            'scores': torch.tensor(scores).cuda().float(),
+-            'labels': torch.tensor(labels).cuda().long(),
+-            'boxes': box_xyxy_to_cxcywh(torch.tensor(boxes).cuda().float())
++            'scores': (scores).cuda().float(),
++            'labels': (labels).cuda().long(),
++            'boxes': box_xyxy_to_cxcywh((boxes).cuda().float())
+         })
+     # print(merged_labels)
+     return merged_labels
+\ No newline at end of file
+diff --git a/models/deformable_detr.py b/models/deformable_detr.py
+index 15b654b..9d7fff6 100644
+--- a/models/deformable_detr.py
++++ b/models/deformable_detr.py
+@@ -4,8 +4,11 @@ import copy
+ import torch
+ from torch.nn.functional import relu, interpolate
+ from torch import nn
+-
+-
++from .grl import GradientReversal,DomainDiscriminator
++from utils.distributed_utils import is_main_process,is_dist_avail_and_initialized
++import torch.distributed as dist
++from .vis_tools import * 
++# 使用示例
+ class MLP(nn.Module):
+ 
+     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+@@ -75,8 +78,6 @@ class SPAttention(nn.Module):
+     def forward(self, x, y):
+         sp_weight = self.sp(x)  # [B, 1, H, W]
+         return y * sp_weight.expand_as(y)  # 通道权重
+-
+-
+ class DeformableDETR(nn.Module):
+ 
+     def __init__(self,
+@@ -124,11 +125,65 @@ class DeformableDETR(nn.Module):
+ 
+             #build projection blocks
+             self.fuse_type = fuse_type
++            out_channel = 768
++            stride = [4,2,1]
+             out_channels = [512,1024,2048]
+-            self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
+-            
++            # self.projs = nn.ModuleList([ nn.Conv2d(768, i, kernel_size=1) for i in out_channels])
++            self.projs = nn.ModuleList()
++            enable_norm = False
++            enable_simple_feature_pyramid = False
++            for s,c in zip(stride,out_channels):
++                if not enable_simple_feature_pyramid:
++                    self.projs.append(nn.Sequential(nn.Conv2d(out_channel, c, kernel_size=1), nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
++                    continue
++                if s == 4:
++                    self.projs.append( nn.Sequential(nn.ConvTranspose2d(out_channel, c, kernel_size=2,stride=2),
++                                     nn.GELU(),
++                                     nn.ConvTranspose2d(c, c, kernel_size=2,stride=2),
++                                     nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
++                elif s == 2:
++                    self.projs.append( nn.Sequential(nn.ConvTranspose2d(out_channel, c, kernel_size=2,stride=2),nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
++                elif s  ==1:
++                    self.projs.append( nn.Sequential(nn.Conv2d(out_channel, c, kernel_size=1),nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
++                elif s == 0.5:
++                    self.projs.append( nn.Sequential(nn.Conv2d(out_channel, 256, kernel_size=2, stride=2),nn.GroupNorm(32,c) if enable_norm else nn.Identity()))
++            # self.inter_box_head =  nn.Linear(self.hidden_dim, self.num_classes)
++            # self.inter_class_head = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
++            if self.fuse_type == 'cat_add':
++                self.cat_projs = nn.ModuleList()
++                for c in out_channels:
++                    self.cat_projs.append(nn.Sequential(nn.Conv2d(2*c, c, kernel_size=3,padding=1), nn.GELU(), nn.Conv2d(c,c,kernel_size=3,padding=1)))
++            elif self.fuse_type == 'ch_add':
++                self.gate_block = nn.ModuleList()
++                for c in out_channels:
++                    self.gate_block.append(nn.Sequential(nn.AdaptiveMaxPool2d((1,1)), nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,c,kernel_size=1,padding=0), nn.Sigmoid()))
++            elif self.fuse_type == 'sp_ch_add':
++                self.gate_block_1 = nn.ModuleList()
++                self.gate_block_2 = nn.ModuleList()
++                for c in out_channels:
++                    self.gate_block_1.append(nn.Sequential(nn.AdaptiveMaxPool2d((1,1)), nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,c,kernel_size=1,padding=0), nn.Sigmoid()))
++                    self.gate_block_2.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
++            elif 'gate_add' in self.fuse_type:
++                self.gate_block = nn.ModuleList()
++                for c in out_channels:
++                    self.gate_block.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
++            elif self.fuse_type == 'grl_gate_add':
++                self.gate_block = nn.ModuleList()
++                for c in out_channels:
++                    self.gate_block.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
++                self.grl_block = GradientReversal()
++                # self.discriminator = DomainDiscriminator(256)
++                # self.rev_proj = nn.Sequential(nn.Conv2d(256, 256, kernel_size=1), nn.GELU(), nn.Conv2d(256,768,kernel_size=1))
++            elif self.fuse_type == 'residual_add':
++                self.gate_block = nn.ModuleList()
++                self.residual_projs = nn.ModuleList()
++                for c in out_channels:
++                    self.gate_block.append(nn.Sequential(nn.Conv2d(c, c, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(c,1,kernel_size=1,padding=0), nn.Sigmoid()))
++                for c in out_channels:
++                    self.residual_projs.append(nn.Sequential(nn.Conv2d(c, 1024, kernel_size=1,padding=0), nn.GELU(), nn.Conv2d(1024,c,kernel_size=1,padding=0)))
++                
+             #maybe some fusion block
+-            if self.fuse_type == 'se':
++            elif self.fuse_type == 'se':
+                 self.se_blocks = nn.ModuleList([SEAttention(i) for i in out_channels])
+             elif self.fuse_type == 'sp':
+                 self.sp_blocks = nn.ModuleList([SPAttention(i) for i in out_channels])
+@@ -136,80 +191,169 @@ class DeformableDETR(nn.Module):
+                 self.fuse_blocks = nn.ModuleList([ConvBlock(i, 1024, i, 2) for i in out_channels])
+ 
+             self.dino_transform = dino_transform
+-            self.dino_factor = nn.Parameter(torch.tensor(0.01), requires_grad=False)
++            self.dino_factor = nn.Parameter(torch.tensor(0.1), requires_grad=False)
+             self.dino_step = 0.01
+     @torch.no_grad()
+     def forward_dino(self, data, output_shape=None, keyword='image_weak', max_length=560, patch_size=14,):
+         #data is an image tensor [B,C,H,W] 
+         transforms = self.dino_transform
+         model_dino = self.dino_backbone
+-        assert max_length % patch_size == 0
+         import torch.nn.functional as F
+         output = []
+-        h,w = data.shape[2:4]
++        #compute the target size accoding to the original aspect ratio
++        b,c,h,w = data.shape
+         x = data
+         if h <= w:
+             s_w = max_length
+             s_h = s_w * (h/w)
+-            s_h = (s_h // patch_size) * patch_size
+         else:
+             s_h = max_length
+             s_w = s_h * (w/h)
+-            s_w = (s_w // patch_size) * patch_size
++        #adjust slightly to fit the patch size
++        s_h = (s_h // patch_size) * patch_size
++        s_w = (s_w // patch_size) * patch_size
+         s_h, s_w = int(s_h), int(s_w)
++
++        #resize image to the target size
+         x = F.interpolate(x, (s_h, s_w), mode='bilinear')
+-        feat = model_dino.forward_features(x)
+-        feat = feat['x_norm_patchtokens'].reshape(1, s_h//patch_size, s_w//patch_size,-1).permute(0,3,1,2)
+-        if output_shape is None:
+-            output_shape = s_h//patch_size, s_w//patch_size
+-        feat = F.interpolate(feat, output_shape, mode='bilinear')   
++
++        #forward
++        feat_dict = model_dino.forward_features(x)
++        
++        #reshape to B,C,H,W
++        feat = feat_dict['x_norm_patchtokens'].reshape(b, s_h//patch_size, s_w//patch_size,-1).permute(0,3,1,2)
++        if output_shape is not None:
++            #reisze to outshape if given
++            feat = F.interpolate(feat, output_shape, mode='bilinear')   
+         return feat
+ 
+-    def fuse(self, features_cnn, features_dino, target_layer=1):
++    def fuse(self, features_cnn, features_dino,debug=True):
+         import torch.nn.functional as F
+-        dino_feats = []
+-        if self.fuse_type == 'add':
+-            for target_layer in range(3):
++        dino_feats = {}
++        for target_layer in range(len(features_cnn)):
++            dino_feats[f'cnn_feats_{target_layer}'] = features_cnn[target_layer]
++
++            if self.fuse_type == 'add':
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
++            elif self.fuse_type == 'adaptive_add':
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
++                with torch.no_grad():
++                    scale = (features_cnn[target_layer].norm(dim=1)/dino_proj_feats.norm(dim=1)).mean()
++                if is_dist_avail_and_initialized():
++                    if not isinstance(scale, torch.Tensor):
++                        raise TypeError(f"Expected tensor, got {type(scale)}")
++                    dist.all_reduce(scale, op=dist.ReduceOp.SUM)
++                scale /= dist.get_world_size()
++                if not hasattr(self, f'scale'):
++                    self.register_buffer('scale', torch.tensor([1.,1.,1.],requires_grad=False).cuda())
++                else:
++                    self.scale[target_layer] = self.scale[target_layer] * 0.99 + scale * 0.01
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * self.scale[target_layer].clone()
++
++            elif self.fuse_type == 'mul':
+                 #blending
+                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor #* torch.exp(self.learnable_weight)
+-                dino_feats.append(dino_proj_feats)
+-        elif self.fuse_type == 'blending':
+-            for target_layer in range(3):
++                #norm
++                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
++                # dino_feat_norm = 
++                dino_feats.update({f'cnn_feats_{target_layer}':features_cnn[target_layer],  f'dino_feats_{target_layer}':dino_proj_feats})
++                features_cnn[target_layer] = features_cnn[target_layer] * (1 + dino_proj_feats * self.dino_factor)  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
++                # dino_feats.update({f'l2_norm_{target_layer}':dino_proj_feats.norm(dim=1)})
++            elif self.fuse_type == 'grl_gate_add':
+                 #blending
+-                # self.projs[target_layer]
+                 # import pdb;pdb.set_trace()
+                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * torch.exp(self.learnable_weight)
+-                dino_feats.append(dino_proj_feats)
+-        elif self.fuse_type == 'se':
+-            for target_layer in range(3):
++                gate_scores = self.grl_block(self.gate_block[target_layer](dino_proj_feats)) 
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores  / gate_scores.mean()
++                dino_feats[f'metric_sim_score_{target_layer}'] = gate_scores[0][0].mean()
++                # if self.train:
++                #     import torch.nn.functional as F
++                #     # grl_feats_cnn = self.grl_block(features_cnn[2])
++                #     grl_feats_cnn = features_cnn[2]
++                #     grl_feats_dino = self.grl_block(dino_proj_feats)
++                #     dis_score_cnn = self.discriminator(grl_feats_cnn.detach())
++                #     dis_score_dino = self.discriminator(grl_feats_dino)
++                #     dino_feats['dis_cnn_loss'] = F.binary_cross_entropy_with_logits(dis_score_cnn, torch.zeros_like(dis_score_cnn))
++                #     dino_feats['dis_dino_loss'] = F.binary_cross_entropy_with_logits(dis_score_dino, torch.ones_like(dis_score_cnn))
++                #     # rev_feats_dino = self.rev_proj(grl_feats_dino)
++                    # dino_feats['construct_loss'] = F.mse_loss(F.interpolate(rev_feats_dino, features_dino.shape[2:4], mode='bilinear'), features_dino)
++            elif self.fuse_type == 'gate_add':
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
++                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * (self.dino_factor + gate_scores * 0.2)
++                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
++            elif self.fuse_type == 'gate_add_cnn':
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
++                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor *  ( 1 +  gate_scores)
++                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
++
++            elif self.fuse_type == 'impr_gate_add':
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
++                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores / gate_scores.mean()
++                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
++            elif self.fuse_type == 'ch_add':
+                 #blending
++                # import pdb;pdb.set_trace()
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
++                #norm
++                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
++                # dino_feat_norm = 
++                # cat_feats = torch.cat([features_cnn[target_layer], residual_feats],dim=1) #* self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
++                gate_scores = self.gate_block[target_layer](dino_proj_feats) 
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores /gate_scores.mean()
++            elif self.fuse_type == 'sp_ch_add':
+                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor   
+-                features_cnn[target_layer], attn_weight = self.se_blocks[target_layer](features_cnn[target_layer], features_cnn[target_layer])
+-                dino_feats.append(dino_proj_feats) 
+-                # print(target_layer, attn_weight.mean())
+-        elif self.fuse_type == 'sp':
+-            for target_layer in range(3):
++                gate_scores_1 = self.gate_block_1[target_layer](dino_proj_feats) 
++                gate_scores_1 = gate_scores_1/ gate_scores_1.mean()
++                gate_scores_2 = self.gate_block_2[target_layer](dino_proj_feats)
++                gate_scores_2 = gate_scores_2 /gate_scores_2.mean()
++                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor * gate_scores_1 * gate_scores_2
++            elif self.fuse_type == 'residual_add':
+                 #blending
++                # import pdb;pdb.set_trace()
++                cnn_proj_feats =  (features_cnn[target_layer])
++                dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), cnn_proj_feats.shape[2:4], mode='bilinear') 
++                residual_feats = dino_proj_feats - cnn_proj_feats
++                residual_feats_proj = self.residual_projs[target_layer](residual_feats)
++                #norm
++                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
++                # dino_feat_norm = 
++                # cat_feats = torch.cat([features_cnn[target_layer], residual_feats],dim=1) #* self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
++                gate_scores = self.gate_block[target_layer](residual_feats) 
++                features_cnn[target_layer] = features_cnn[target_layer] + residual_feats_proj * self.dino_factor * gate_scores
++                dino_feats[f'l2_norm_{target_layer}'] = (features_cnn[target_layer] - dino_proj_feats).norm(dim=1, p=2)
++                dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0]
++        
++            elif self.fuse_type == 'cat_add':
++                #blending
++                # import pdb;pdb.set_trace()
+                 dino_proj_feats = F.interpolate(self.projs[target_layer](features_dino), features_cnn[target_layer].shape[2:4], mode='bilinear') 
+-                dino_proj_feats = self.sp_blocks[target_layer](features_cnn[target_layer], dino_proj_feats)
+-                features_cnn[target_layer] = features_cnn[target_layer] + dino_proj_feats * self.dino_factor    
+-
+-        elif self.fuse_type == 'attn':
+-            B,C,H,W = features_cnn[target_layer].shape
+-            dino_feats_proj = self.proj(features_dino)
+-            query = features_cnn[target_layer].flatten(2).permute(2,0,1) #B,C,H,W -> HW,B,C
+-            key = value = dino_feats_proj.flatten(2).permute(2,0,1)
+-            attn_out = self.fuse_attn(query, key, value)[0]
+-            attn_out = self.fuse_mlp(attn_out)
+-            # import pdb;pdb.set_trace()
+-            attn_out = self.fuse_ln(value + attn_out)
+-            attn_out = attn_out.permute(1,2,0).view(B,C,H,W)
+-            features_cnn[target_layer] = features_cnn[target_layer] + attn_out * self.dino_factor
+-        else:
+-            raise  NotImplementedError
++                #norm
++                # cnn_feat_norm = feature_cnn[target_layer].norm(dim=1).mean()
++                # dino_feat_norm = 
++                cat_feats = torch.cat([features_cnn[target_layer], dino_proj_feats],dim=1) #* self.dino_factor  # * features_cnn[target_layer].norm()/dino_proj_feats.norm() #* torch.exp(self.learnable_weight)
++                cat_feats = self.cat_projs[target_layer](cat_feats) 
++                features_cnn[target_layer] = features_cnn[target_layer] + cat_feats * self.dino_factor
++                dino_feats.append(dino_proj_feats)
++    
++            elif self.fuse_type == 'attn':
++                B,C,H,W = features_cnn[target_layer].shape
++                dino_feats_proj = self.proj(features_dino)
++                query = features_cnn[target_layer].flatten(2).permute(2,0,1) #B,C,H,W -> HW,B,C
++                key = value = dino_feats_proj.flatten(2).permute(2,0,1)
++                attn_out = self.fuse_attn(query, key, value)[0]
++                attn_out = self.fuse_mlp(attn_out)
++                # import pdb;pdb.set_trace()
++                attn_out = self.fuse_ln(value + attn_out)
++                attn_out = attn_out.permute(1,2,0).view(B,C,H,W)
++                features_cnn[target_layer] = features_cnn[target_layer] + attn_out * self.dino_factor
++            else:
++                raise  NotImplementedError
++            dino_feats[f'dino_feats_{target_layer}'] = dino_proj_feats
++            
+         return features_cnn, dino_feats
+ 
+     def _build_input_projections(self):
+@@ -251,15 +395,61 @@ class DeformableDETR(nn.Module):
+         x1 = x.clamp(min=eps)
+         x2 = (1 - x).clamp(min=eps)
+         return torch.log(x1 / x2)
+-
+     def forward(self, images, masks):
+         # Backbone forward
+-        features = self.backbone(images)
++        features = self.backbone(images)  
+         dino_features = None
++
+         if self.dino_backbone is not None:
+-            target_layer = 1
+-            dino_features = self.forward_dino(images, output_shape=features[target_layer].shape[2:])
+-            features, dino_feats_proj = self.fuse(features, dino_features, target_layer=target_layer)
++            dino_features = self.forward_dino(images, output_shape=None, max_length = max(images.shape)//2)#features[target_layer].shape[2:])
++            #the stride of dino features should be 2 * 14 ~ 28 and is close to 32 of the CNN features
++            # with torch.no_grad():
++            #     import torch.nn.functional as F
++            #     dict_feat = {"cnn_features":features[2].cpu(), 'dino_features':F.interpolate(dino_features.cpu(), features[2].shape[2:], mode='bilinear')}
++            #     torch.save(dict_feat, f"{iter}.pth")
++                # caa_results = cca_analysis(features[0], F.interpolate(dino_features, features[0].shape[2:], mode='bilinear'), n_components=10)
++            # caa_results = cca_analysis(features[1], F.interpolate(dino_features, features[1].shape[2:], mode='bilinear'), n_components=10)
++            features, vis_dict = self.fuse(features, dino_features)
++
++            debug = False
++            if torch.rand(1)<0.00 or debug:
++                # visualize_dino_heatmaps(images, vis_dict, 0)
++                # visualize_dino_heatmaps(images, vis_dict, 1)
++                # visualize_dino_heatmaps(images, vis_dict, 2)
++
++                # visualize_pca(dino_features, images, 'pca_dino.png')
++                # visualize_feature_distribution(vis_dict['cnn_feats_0'], vis_dict['dino_feats_0'], features[0], images, 0)
++                # visualize_feature_distribution(vis_dict['cnn_feats_1'], vis_dict['dino_feats_1'], features[1], images, 1)
++                # visualize_feature_distribution(vis_dict['cnn_feats_2'], vis_dict['dino_feats_2'], features[2], images, 2)
++                # visualize_feat_diff(images,vis_dict['dino_feats_0'], vis_dict['cnn_feats_0'], 'feat_diff_0_trained.png')
++                # visualize_feat_diff(images,vis_dict['dino_feats_1'], vis_dict['cnn_feats_1'], 'feat_diff_1_trained.png')
++                # visualize_feat_diff(images,vis_dict['dino_feats_2'], vis_dict['cnn_feats_2'], 'feat_diff_2_trained.png')
++
++                # import pdb;pdb.set_trace()
++                # images is a tensor of preprocess image
++                # reverse images to original range by ImageNet standard
++                # dino_feats[f'l2_norm_{target_layer}'] = (features_cnn[target_layer] - dino_proj_feats).norm(dim=1, p=2).cpu()
++                # dino_feats[f'sim_score_{target_layer}'] = gate_scores[0][0].cpu()
++                # interpolate these two hot map and overlap it with images
++                # visualize it with plt
++                if 'sim_score_0' in vis_dict:
++                    for target_layer in range(3):
++                        visualize_heat_map(images, vis_dict[f'sim_score_{target_layer}'], f'sim_map_{target_layer}.jpg')
++                        vis_dict[f'metric_sim_score_{target_layer}'] = vis_dict[f'sim_score_{target_layer}'].mean()
++                if debug:
++                    import pdb;pdb.set_trace()
++                    pass
++
++                #compute cca score
++            with torch.no_grad():
++                import torch.nn.functional as F
++                for layer in range(3):
++                    vis_dict[f'metric_cos_fuse_cnn_{layer}'] = torch.round(F.cosine_similarity(vis_dict[f'cnn_feats_{layer}'], features[layer], dim=1).mean(),decimals=3)
++                    vis_dict[f'metric_cos_fuse_dino_{layer}'] = torch.round(F.cosine_similarity(vis_dict[f'dino_feats_{layer}'], features[layer], dim=1).mean(),decimals=3)
++                    vis_dict[f'metric_cos_cnn_dino_{layer}'] = torch.round(F.cosine_similarity(vis_dict[f'dino_feats_{layer}'],vis_dict[f'cnn_feats_{layer}'], dim=1).mean(),decimals=3)
++                    # print(vis_dict[f'metric_cos_fuse_dino_{layer}'])
++                #         print(analyze_orthogonality(vis_dict[f'cnn_feats_{layer}'].cpu(), vis_dict[f'dino_feats_{layer}'].cpu(),  features[layer].cpu()))
++                #         import pdb;pdb.set_trace()
+         # Prepare input features for transformer
+         src_list, mask_list = [], []
+         for i, feature in enumerate(features):
+@@ -273,6 +463,8 @@ class DeformableDETR(nn.Module):
+                 mask = interpolate(masks[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                 src_list.append(src)
+                 mask_list.append(mask)
++
++
+         pos_list = [self.position_encoding(src, mask) for src, mask in zip(src_list, mask_list)]
+         query_embeds = self.query_embed.weight
+         # Transformer forward
+@@ -302,9 +494,14 @@ class DeformableDETR(nn.Module):
+         }
+         if self.dino_backbone is not None:
+             out['dino_features'] = dino_features
+-            out['dino_features_proj'] = dino_feats_proj
++            # out['dino_features_proj'] = dino_feats_proj
+         if hasattr(self, 'inverse_proj'):
+             out['query_embed'] = self.inverse_proj(hs)
+         if hasattr(self, 'dino_factor'):
+             out['dino_factor'] = self.dino_factor
++        out.update(vis_dict)
++        # out['dis_cnn_loss'] = vis_dict['dis_cnn_loss']
++        # out['dis_dino_loss'] = vis_dict['dis_dino_loss']
++        # out['']
++        # out['sim_score'] = [vis_dict['sim_score_0'], vis_dict['sim_score_1'], vis_dict['sim_score_2']]
+         return out

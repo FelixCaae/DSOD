@@ -81,7 +81,7 @@ class HungarianMatcher(nn.Module):
         self.high_quality_matches = high_quality_matches
         assert coef_class != 0 or coef_bbox != 0 or coef_giou != 0, "all costs cant be 0"
 
-    def forward(self, pred_logits, pred_boxes, annotations):
+    def forward(self, pred_logits, pred_boxes, annotations, match_logits = False):
         """ Performs the matching
 
         Params:
@@ -109,9 +109,13 @@ class HungarianMatcher(nn.Module):
             pred_boxes = pred_boxes.flatten(0, 1)  # [batch_size * num_queries, 4]
 
             # Also concat the target labels and boxes
-            gt_class = torch.cat([anno["labels"] for anno in annotations]).to(pred_logits.device)
-            gt_boxes = torch.cat([anno["boxes"] for anno in annotations]).to(pred_logits.device)
-
+            if not match_logits:
+                gt_class = torch.cat([anno["labels"] for anno in annotations]).to(pred_logits.device)
+                gt_boxes = torch.cat([anno["boxes"] for anno in annotations]).to(pred_logits.device)
+            else:
+                target_logits, target_boxes = annotations
+                target_logits = target_logits.flatten(0, 1).sigmoid()
+                target_boxes = target_boxes.flatten(0, 1)
             if self.high_quality_matches:
                 class_score = pred_logits[:, gt_class]  # shape = [batch_size * num_queries, gt num within a batch]
 
@@ -120,6 +124,22 @@ class HungarianMatcher(nn.Module):
 
                 # Final cost matrix
                 C = (-1) * (class_score * torch.pow(bbox_iou, self.iou_order_alpha))
+            elif match_logits:
+                p_i = target_logits.unsqueeze(0)  # 第i个类别的教师概率
+                q_i = pred_logits.unsqueeze(1)  # 第i个类别的学生概率
+
+                kl_i = p_i * torch.log(p_i / q_i) + (1 - p_i) * torch.log((1 - p_i) / (1 - q_i))
+
+                cost_class = kl_i.sum(dim=-1) #.mean(dim=-1)
+                # Compute the L1 cost between boxes
+                cost_boxes = torch.cdist(pred_boxes, target_boxes, p=1)
+
+                # Compute the giou cost between boxes
+                cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(target_boxes))
+
+                # Final cost matrix
+                C = self.coef_bbox * cost_boxes + 5 * cost_class + self.coef_giou * cost_giou
+
             else:  # Default matching
                 # Compute the classification cost.
                 neg_cost_class = (1 - self.alpha) * (pred_logits ** self.gamma) * (-(1 - pred_logits + 1e-8).log())
@@ -136,13 +156,43 @@ class HungarianMatcher(nn.Module):
                 C = self.coef_bbox * cost_boxes + self.coef_class * cost_class + self.coef_giou * cost_giou
 
             C = C.view(bs, num_queries, -1).cpu()
-
-            sizes = [len(anno["boxes"]) for anno in annotations]
+            if match_logits:
+                sizes = [num_queries for i in range(bs)]
+            else:
+                sizes = [len(anno["boxes"]) for anno in annotations]
             indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
             return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 import torch.nn.functional as  F
+def make_gaussian(h,w, annotations, device, lower_bound=0.1):
+    targets = torch.zeros(h,w, device=device) + lower_bound
+    annots_boxes = annotations[0]['boxes']
+    annots_classes = annotations[0]['labels']
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(h, device=device, dtype=torch.float32),
+        torch.arange(w, device=device, dtype=torch.float32),
+        indexing='ij'
+    )
+    scale  = 1
+    with torch.no_grad():
+        anchor_grids = torch.stack([x_grid/w, y_grid/h], dim=-1)
+        for (cx,cy,bw,bh), class_ in zip(annots_boxes, annots_classes):
+            #compute relative scale and scale sensitive weight
+            area = torch.sqrt((bw/w) * (bh/h))
+            # ac_area = anchor_area[layer]
+            # weight = torch.exp(-(area - ac_area)**2 / temperature**2)
+            
+            #compute distance
+            dist = (anchor_grids - torch.tensor([cx, cy], device=device, dtype=torch.float32))**2
+            sigma_w, sigma_h = bw/scale , bh/scale
 
+            #compute gaussian
+            dist = -0.5 * dist / torch.tensor([sigma_w**2, sigma_h**2], device=device, dtype=torch.float32)
+            gaussian = torch.exp(dist.sum(dim=-1)) *  1  #/ math.sqrt(2*math.pi) 
+
+            targets = torch.maximum(targets,gaussian)
+    return targets
+                #visualize
 class SetCriterion(nn.Module):
 
     def __init__(self,
@@ -150,6 +200,7 @@ class SetCriterion(nn.Module):
                  coef_class=2,
                  coef_boxes=5,
                  coef_giou=2,
+                 coef_feat = 0.5,
                  alpha_focal=0.25,
                  alpha_dt=0.5,
                  gamma_dt=0.9,
@@ -163,6 +214,7 @@ class SetCriterion(nn.Module):
         self.coef_class = coef_class
         self.coef_boxes = coef_boxes
         self.coef_giou = coef_giou
+        self.coef_feat = coef_feat
         self.alpha_focal = alpha_focal
         self.logits_sum = [torch.zeros(1, dtype=torch.float, device=device) for _ in range(num_classes)]
         self.logits_count = [torch.zeros(1, dtype=torch.int, device=device) for _ in range(num_classes)]
@@ -171,7 +223,7 @@ class SetCriterion(nn.Module):
         self.max_dt = max_dt
 
     @staticmethod
-    def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+    def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2, reduction='num_box'):
         """
         Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
         Args:
@@ -194,8 +246,39 @@ class SetCriterion(nn.Module):
         if alpha >= 0:
             alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
             loss = alpha_t * loss
-        return loss.mean(1).sum() / num_boxes
-
+        if reduction == 'num_box':
+            return loss.mean(1).sum() / num_boxes
+        elif reduction == 'mean':
+            return loss.mean()
+        else:
+            raise NotImplementedError
+    
+    # @staticmethod
+    # def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+    #     """
+    #     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    #     Args:
+    #         inputs: A float tensor of arbitrary shape.
+    #                 The predictions for each example.
+    #         targets: A float tensor with the same shape as inputs. Stores the binary
+    #                 classification label for each element in inputs
+    #                 (0 for the negative class and 1 for the positive class).
+    #         alpha: (optional) Weighting factor in range (0,1) to balance
+    #                 positive vs negative examples. Default = -1 (no weighting).
+    #         gamma: Exponent of the modulating factor (1 - p_t) to
+    #             balance easy vs hard examples.
+    #     Returns:
+    #         Loss tensor
+    #     """
+    #     prob = inputs.sigmoid()
+    #     ce_loss = binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    #     p_t = prob * targets + (1 - prob) * (1 - targets)
+    #     loss = ce_loss * ((1 - p_t) ** gamma)
+    #     if alpha >= 0:
+    #         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    #         loss = alpha_t * loss
+    #     return loss.mean(1).sum() / num_boxes
+    
     @staticmethod
     def sigmoid_quality_focal_loss(inputs, targets, scores, num_boxes, alpha: float = 0.25, gamma: float = 2):
         """
@@ -227,10 +310,13 @@ class SetCriterion(nn.Module):
             loss = alpha_t * loss
         return loss.mean(1).sum() / num_boxes
 
-    def loss_class(self, pred_logits, annotations, indices, num_boxes, use_pseudo_label_weights=False):
+    def loss_class(self, pred_logits, annotations, indices, num_boxes, use_pseudo_label_weights=False,logit_distill=False):
         """Classification loss (NLL)
         annotations dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
+            #distill logits instead of class
+
+
         idx = self._get_src_permutation_idx(indices)
         gt_classes_o = torch.cat([anno["labels"][j] for anno, (_, j) in zip(annotations, indices)])
         gt_classes = torch.full(pred_logits.shape[:2], self.num_classes, dtype=torch.int64, device=pred_logits.device)
@@ -311,7 +397,37 @@ class SetCriterion(nn.Module):
     def clear_positive_logits(self):
         self.logits_sum = [torch.zeros(1, dtype=torch.float, device=self.device) for _ in range(self.num_classes)]
         self.logits_count = [torch.zeros(1, dtype=torch.int, device=self.device) for _ in range(self.num_classes)]
-
+    @staticmethod
+    def binary_kl_divergence(p_logits, q_logits, temperature=1.0, reduction='mean'):
+        """
+        p_logits: 教师模型logits
+        q_logits: 学生模型logits
+        计算KL(p||q)
+        """
+        # 应用Sigmoid得到概率
+        p = torch.sigmoid(p_logits / temperature)
+        q = torch.sigmoid(q_logits / temperature)
+        
+        # 避免数值不稳定
+        eps = 1e-8
+        p = torch.clamp(p, eps, 1.0 - eps)
+        q = torch.clamp(q, eps, 1.0 - eps)
+        
+        # 计算KL散度
+        # KL(p||q) = p*log(p/q) + (1-p)*log((1-p)/(1-q))
+        kl_positive = p * torch.log(p / q)
+        kl_negative = (1 - p) * torch.log((1 - p) / (1 - q))
+        kl = kl_positive + kl_negative
+        
+        # 对所有类别求和
+        kl_sum = kl.sum(dim=-1)
+        
+        if reduction == 'mean':
+            return kl_sum.mean()
+        elif reduction == 'batchmean':
+            return kl_sum.sum() / p_logits.size(0)
+        else:
+            return kl_sum
     @staticmethod
     def _get_src_permutation_idx(indices):
         # Permute predictions following indices
@@ -341,8 +457,48 @@ class SetCriterion(nn.Module):
                 out[key] = value[reserve_index, ...]
         annotations = [annotations[idx] for idx in reserve_index]
         return out, annotations
+    def forward_logits(self, out, teacher_out):
+        logit_all = out['logit_all']
+        boxes_all = out['boxes_all']
+        tch_logit_all = teacher_out['logit_all']
+        tch_boxes_all = teacher_out['boxes_all']
+        # import pdb;pdb.set_trace()
+        # Compute the average number of target boxes across all nodes, for normalization purposes
+        # num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        num_boxes = logit_all.shape[2]
+        # Compute all the requested losses
+        loss = torch.zeros(1).to(logit_all.device)
+        loss_dict = defaultdict(float)
+        num_decoder_layers = logit_all.shape[0]
+        for i in range(num_decoder_layers):
+            # Compute DETR losses
+            # Retrieve the matching between the outputs of the last layer and the targets
+            indices = self.matcher(logit_all[i], boxes_all[i], (tch_logit_all[i], tch_boxes_all[i]), match_logits=True)
+            src_ind = self._get_src_permutation_idx(indices)
+            tgt_ind = self._get_tgt_permutation_idx(indices)
+            # Compute the DETR losses
+            # loss_class = self.loss_class(logit_all[i], annotations, indices, num_boxes, use_pseudo_label_weights)
+            # q_i = logit_all[i][src_ind].sigmoid()
+            # p_i = tch_logit_all[i][tgt_ind].sigmoid()
+            # kl_i = p_i * torch.log(p_i / q_i) + (1 - p_i) * torch.log((1 - p_i) / (1 - q_i))
+            loss_class = self.binary_kl_divergence(tch_logit_all[i][tgt_ind], logit_all[i][src_ind], temperature=1, reduction='batchmean')
+            # loss_class = F.mse_loss(logit_all[i][src_ind], tch_logit_all[i][tgt_ind])
+            loss_boxes = l1_loss(boxes_all[i][src_ind], tch_boxes_all[i][tgt_ind], reduction='none').sum()/num_boxes
+            loss_giou = (1 - torch.diag(generalized_box_iou(
+                box_cxcywh_to_xyxy(boxes_all[i][src_ind]),
+                box_cxcywh_to_xyxy(tch_boxes_all[i][tgt_ind])))).sum() / num_boxes
 
-    def forward(self, out, annotations=None, use_pseudo_label_weights=False):
+            loss_dict["loss_class_distill"] += loss_class 
+            loss_dict["loss_boxes_distill"] += loss_boxes
+            loss_dict["loss_giou_distill"] += loss_giou 
+            loss += 5 * loss_class  + self.coef_boxes * loss_boxes + self.coef_giou * loss_giou
+        # Calculate average for all decoder layers
+        for k, v in loss_dict.items():
+            loss_dict[k] /= num_decoder_layers
+        loss /= num_decoder_layers
+        return loss, loss_dict
+
+    def forward(self, out, annotations=None, use_pseudo_label_weights=False, disitll_logits=False, mask_loss=False):
         logit_all = out['logit_all']
         boxes_all = out['boxes_all']
         # import pdb;pdb.set_trace()
@@ -378,94 +534,37 @@ class SetCriterion(nn.Module):
             loss_dict['dis_cnn_loss'] = out['dis_cnn_loss']
             loss_dict['dis_dino_loss'] = out['dis_dino_loss']
         enable_sim_score_loss=  True
+
         if 'sim_score_0' in out and enable_sim_score_loss:
             #compute centerness with fg box in annotations and generate a heat map 
             #compute mse loss between sim_score and fg centerness mask
             sim_score_loss = 0
             anchor_area = [0.01, 0.1, 0.2]
             temperature = 0.2
-            for layer in range(3):
-                sim_score = out[f'sim_score_{layer}']
-                targets = torch.zeros_like(sim_score) 
-                h, w = sim_score.shape
-                annots_boxes = annotations[0]['boxes'] * torch.tensor([w,h,w,h]).to(targets.device)
-                y_grid, x_grid = torch.meshgrid(
-                    torch.arange(h, device=sim_score.device, dtype=torch.float32),
-                    torch.arange(w, device=sim_score.device, dtype=torch.float32),
-                    indexing='ij'
-                )
-                #H,W,2
-                # scale = 2**(3-layer)
-                scale = 1
-                with torch.no_grad():
-                    anchor_grids = torch.stack([x_grid, y_grid], dim=-1)
-                    for cx,cy,bw,bh in annots_boxes:
-                        #compute relative scale and scale sensitive weight
-                        area = torch.sqrt((bw/w) * (bh/h))
-                        ac_area = anchor_area[layer]
-                        weight = torch.exp(-(area - ac_area)**2 / temperature**2)
-                        
-                        #compute distance
-                        dist = (anchor_grids - torch.tensor([cx, cy], device=sim_score.device, dtype=torch.float32))**2
-                        sigma_w, sigma_h = bw/scale , bh/scale
+          
 
-                        #compute gaussian
-                        dist = -0.5 * dist / torch.tensor([sigma_w**2, sigma_h**2], device=sim_score.device, dtype=torch.float32)
-                        gaussian = torch.exp(dist.sum(dim=-1)) *  1 / math.sqrt(2*math.pi) 
-                        targets = torch.maximum(targets,gaussian)
-
-                #visualize
-                import cv2
-                # plt.imshow(targets.cpu())
-                # vis_sim = F.interpolate(targets.cpu().unsqueeze(0).unsqueeze(0), (h*4,w*4), mode='bilinear')
-                # cv2.imwrite(f'test_sim_target_{layer}.jpg', vis_sim[0][0].numpy()*255)
-
-                bce_loss = F.binary_cross_entropy_with_logits(inverse_sigmoid(sim_score), targets, reduction='none').mean()
-                # bce_loss = bce_loss[targets!=0].sum()/(targets.sum()+1e-5)
-                sim_score_loss += bce_loss
+                # visualize = False
+                # if visualize:
+                #     import cv2
+                #     from matplotlib import pyplot as plt
+                #     vis_sim = F.interpolate(targets.cpu().unsqueeze(0).unsqueeze(0), (h*4,w*4), mode='bilinear')
+                #     img = (vis_sim[0][0].numpy()*255).astype('uint8')
+                #     for box in annots_boxes.cpu():
+                #         box = box.int().numpy().tolist()
+                #         x1,y1,x2,y2 = box[0] - box[2]//2, box[1] - box[3]//2, box[0] + box[2]//2, box[1] + box[3]//2
+                #         img = cv2.rectangle(img, (x1,y1),(x2,y2),(0, 255, 0))
+                #     cv2.imwrite(f'test_sim_target_{layer}.jpg', img)
+                # bce_loss = self.sigmoid_focal_loss(inverse_sigmoid(sim_score), targets, reduction='mean', num_boxes=1)
+                # # bce_loss = bce_loss[targets!=0].sum()/(targets.sum()+1e-5)
+                # sim_score_loss += bce_loss
             loss += sim_score_loss 
-            loss_dict['sim_score_loss'] = sim_score_loss / 3 / 2
+            loss_dict['sim_score_loss'] = sim_score_loss 
             # loss_dict['construct_loss'] = out['construct_loss']
         # for k, v in loss_dict.items():
         #     loss_dict[k] /= num_decoder_layers
         # feature_alignment_loss = F.mse_loss(out['features'][-1], out['dino_features'][-1], reduction='mean') + F.mse_loss(out['features'][-2], out['dino_features'][-2], reduction='mean') + F.mse_loss(out['features'][-3], out['dino_features'][-3], reduction='mean')
         # loss_dict['feature_alignment_loss'] = feature_alignment_loss.detach()
         # loss += feature_alignment_loss 
-        enable_logit_alignment = False
-        distill_type = 'logit_mse'
-        if enable_logit_alignment and 'teacher_logit_all' in  out:
-            if distill_type == 'logit_mse':
-                logit_mse_loss = F.mse_loss(out['teacher_logit_all'], out['logit_all'])
-                loss = loss + logit_mse_loss
-                loss_dict['logit_mse_loss'] = logit_mse_loss
-            elif distill_type == 'logit+box':
-                logit_mse_loss = F.mse_loss(out['teacher_logit_all'], out['logit_all'])
-                box_l1_loss = F.smooth_l1_loss(out['teacher_boxes_all'], out['boxes_all'])
-                loss = loss + logit_mse_loss + box_l1_loss 
-                loss_dict['logit_mse_loss'] = logit_mse_loss + box_l1_loss
-            elif distill_type == 'box_only':
-                logit_mse_loss = F.mse_loss(out['teacher_logit_all'], out['logit_all'])
-                box_l1_loss = F.smooth_l1_loss(out['teacher_boxes_all'], out['boxes_all'],reduction='none').sum() / num_decoder_layers /num_boxes
-                loss = loss +  box_l1_loss 
-                loss_dict['logit_mse_loss'] =   box_l1_loss
-                
-            elif distill_type == 'sigmoid_mse':
-                logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
-                loss = loss + logit_mse_loss * 10
-                loss_dict['logit_mse_loss'] = logit_mse_loss
-            elif distill_type == 'kl':
-                logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
-                loss = loss + logit_mse_loss
-                loss_dict['logit_mse_loss'] = logit_mse_loss
-            elif distill_type == 'weighted_mse':
-                iou_weight = batched_diag_iou(box_cxcywh_to_xyxy(out['teacher_boxes_all']) , box_cxcywh_to_xyxy(out['boxes_all'])).detach()
-                logit_mse_loss = iou_weight.unsqueeze(-1) * F.mse_loss(out['teacher_logit_all'], out['logit_all'], reduction='none')
-                loss = loss + logit_mse_loss.mean()
-                loss_dict['logit_mse_loss'] = logit_mse_loss.mean()
-            elif distill_type == 'weighted_kl':
-                logit_mse_loss = F.mse_loss(out['teacher_logit_all'].sigmoid(), out['logit_all'].sigmoid())
-                loss = loss + logit_mse_loss
-                loss_dict['logit_mse_loss'] = logit_mse_loss
 
 
         enable_feature_alignment = False
@@ -488,7 +587,23 @@ class SetCriterion(nn.Module):
             loss += loss_dict['query_alignment_loss'] * 1
         if 'dino_features_proj' in out:
             loss_dict['dino_feats_proj_norm'] = out['dino_features_proj'][-1].norm(dim=1,p=2).mean()
-        
+        if 'loss_feat_align' in out:
+            loss += out['loss_feat_align'] * 0.1
+            loss_dict.update({'loss_feat_align': out['loss_feat_align']})
+        if 'loss_feat_align_0' in out:
+            gaussian = make_gaussian(100,100, annotations, device=out['loss_feat_align_0'].device, lower_bound=0.1)
+            loss_feat_align_0 = out['loss_feat_align_0']
+            loss_feat_align_1 = out['loss_feat_align_1']
+            loss_feat_align_2 = out['loss_feat_align_2']
+            gaussian_0 = F.interpolate(gaussian[None,None,:,:], loss_feat_align_0.shape[-2:], mode='bilinear')
+            gaussian_1 = F.interpolate(gaussian[None,None,:,:], loss_feat_align_1.shape[-2:], mode='bilinear')
+            gaussian_2 = F.interpolate(gaussian[None,None,:,:], loss_feat_align_2.shape[-2:], mode='bilinear')
+            loss_feat_align = (loss_feat_align_0 * gaussian_0).mean() + (loss_feat_align_1 * gaussian_1).mean() + (loss_feat_align_2 * gaussian_2).mean()
+            loss += loss_feat_align * self.coef_feat
+            loss_dict.update({'loss_feat_align_gaussian':loss_feat_align})
+        if 'loss_encoder_align'  in out:
+            loss += out['loss_encoder_align']# * 0.1
+            loss_dict.update({'loss_encoder_align': out['loss_encoder_align']})
         #update metric
         if 'dino_factor' in out:
             loss_dict['dino_factor'] = out['dino_factor']
@@ -497,8 +612,9 @@ class SetCriterion(nn.Module):
 
 
 
+
 @torch.no_grad()
-def post_process(pred_logits, pred_boxes, target_sizes, topk=100):
+def post_process(pred_logits, pred_boxes, target_sizes,topk=100, is_nms=False, nms_threshold=0.6):
     """ Perform the computation
         Parameters:
             outputs -> pred_logits, pred_boxes: raw outputs of the model
@@ -509,19 +625,41 @@ def post_process(pred_logits, pred_boxes, target_sizes, topk=100):
     assert len(pred_logits) == len(target_sizes)
     assert target_sizes.shape[1] == 2
 
-    prob = pred_logits.sigmoid()
-    topk_values, topk_indexes = torch.topk(prob.view(pred_logits.shape[0], -1), topk, dim=1)
-    scores = topk_values
-    topk_boxes = torch.div(topk_indexes, pred_logits.shape[2], rounding_mode='trunc')
-    labels = topk_indexes % pred_logits.shape[2]
-    boxes = box_cxcywh_to_xyxy(pred_boxes)
-    boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
+    if is_nms:
+        results = []
+        for i in range(len(pred_boxes)):
+            prob_img = pred_logits[i].sigmoid()
+            nms_idx = batched_nms(box_cxcywh_to_xyxy(pred_boxes[i]), prob_img.max(dim=-1)[0], prob_img.max(dim=-1)[1], iou_threshold=nms_threshold)
+            pred_boxes_img = pred_boxes[i][nms_idx]
+            prob_img = prob_img[nms_idx]
+            pred_logits_img = pred_logits[i][nms_idx]
 
-    # From relative [0, 1] to absolute [0, height] coordinates
-    img_h, img_w = target_sizes.unbind(1)
-    scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
-    boxes = boxes * scale_fct[:, None, :]
-    results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+            topk_values, topk_indexes = torch.topk(prob_img.view(-1), topk, dim=0)
+            scores = topk_values
+            topk_boxes = torch.div(topk_indexes, pred_logits.shape[2], rounding_mode='trunc')
+            labels = topk_indexes % pred_logits.shape[2]
+            boxes = box_cxcywh_to_xyxy(pred_boxes_img)
+            boxes = torch.gather(boxes, 0, topk_boxes.unsqueeze(-1).repeat( 1, 4))
+
+            # From relative [0, 1] to absolute [0, height] coordinates
+            img_h, img_w = target_sizes.unbind(1)
+            scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+            boxes = boxes * scale_fct[:, :]
+            results  = results + [{'scores': scores, 'labels': labels, 'boxes': boxes} ]
+    else:
+        prob = pred_logits.sigmoid()
+        topk_values, topk_indexes = torch.topk(prob.view(pred_logits.shape[0], -1), topk, dim=1)
+        scores = topk_values
+        topk_boxes = torch.div(topk_indexes, pred_logits.shape[2], rounding_mode='trunc')
+        labels = topk_indexes % pred_logits.shape[2]
+        boxes = box_cxcywh_to_xyxy(pred_boxes)
+        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
+
+        # From relative [0, 1] to absolute [0, height] coordinates
+        img_h, img_w = target_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        boxes = boxes * scale_fct[:, None, :]
+        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
     return results
 
 def get_topk_outputs(pred_logits, pred_boxes, topk=50):
@@ -551,7 +689,7 @@ def get_pseudo_labels(pred_logits, pred_boxes, thresholds, is_nms=False, nms_thr
         larger_idx = torch.gt(scores, thresholds_tensor[labels]).nonzero()[:, 0]
         scores, labels, boxes = scores[larger_idx], labels[larger_idx], pred_box[larger_idx, :]
         if is_nms:
-            nms_idx = nms(box_cxcywh_to_xyxy(boxes), scores, iou_threshold=nms_threshold)
+            nms_idx = batched_nms(box_cxcywh_to_xyxy(boxes), scores, labels, iou_threshold=nms_threshold)
             scores, labels, boxes = scores[nms_idx], labels[nms_idx], boxes[nms_idx, :]
         pseudo_labels.append({'scores': scores, 'labels': labels, 'boxes': boxes})
     return pseudo_labels

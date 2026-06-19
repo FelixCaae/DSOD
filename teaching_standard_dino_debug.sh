@@ -1,12 +1,14 @@
-N_GPUS=8
-BATCH_SIZE=8
+N_GPUS=1
+BATCH_SIZE=1
 DATA_ROOT=./dataset
-OUTPUT_DIR=./city2foggy/teaching_standard
+OUTPUT_DIR=./city2foggy/teaching_standard_tr05
 
  OMP_NUM_THREADS=4 torchrun \
 --rdzv_endpoint localhost:26505 \
 --nproc_per_node=${N_GPUS} \
-main.py \
+main_v3.py \
+--enable_dino \
+--fuse_type add \
 --backbone resnet50 \
 --num_encoder_layers 6 \
 --num_decoder_layers 6 \
@@ -21,12 +23,10 @@ main.py \
 --lr_backbone 2e-5 \
 --lr_linear_proj 2e-5 \
 --alpha_ema 0.999 \
---epoch 10 \
+--epoch 30 \
 --epoch_lr_drop 80 \
 --mode teaching_standard \
---enable_smooth \
---enable_feature_alignment \
---threshold 0.3 \
+--threshold 0.5 \
 --fix_update_iter 1 \
 --output_dir ${OUTPUT_DIR} \
 --resume city2foggy_source_only_29_53.pth
