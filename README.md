@@ -266,12 +266,18 @@ This project is built upon:
 If you find this work useful, please cite:
 
 ```bibtex
-@article{dsod2026,
-  title  = {Debiased Source-Free Object Detection},
-  author = {Cai, Zhi},
-  journal= {Pattern Recognition},
-  volume = {26},
-  year   = {2026}
+@article{CAI2026113545,
+title = {Towards unbiased source-free object detection via vision foundation models},
+journal = {Pattern Recognition},
+volume = {179},
+pages = {113545},
+year = {2026},
+issn = {0031-3203},
+doi = {https://doi.org/10.1016/j.patcog.2026.113545},
+url = {https://www.sciencedirect.com/science/article/pii/S003132032600511X},
+author = {Zhi Cai and Yingjie Gao and Yanan Zhang and Xinzhu Ma and Di Huang},
+keywords = {Source-free object detection, VFM, Knowledge distillation},
+abstract = {Source-Free Object Detection (SFOD) has garnered much attention in recent years by eliminating the need of source-domain data in cross-domain tasks, but existing SFOD methods suffer from the Source Bias problem, i.e. the adapted model remains skewed towards the source domain, leading to poor generalization and error accumulation during self-training. To overcome this challenge, we propose Debiased Source-free Object Detection (DSOD), a novel VFM-assisted SFOD framework that can effectively mitigate source bias with the help of powerful VFMs. Specifically, we propose Unified Feature Injection (UFI) module that integrates VFM features into the CNN backbone through Simple-Scale Extension (SSE) and Domain-aware Adaptive Weighting (DAAW). Then, we propose Semantic-aware Feature Regularization (SAFR) that constrains feature learning to prevent overfitting to source domain characteristics. Furthermore, we propose a VFM-free variant, termed DSOD-distill for computation-restricted scenarios through a novel Dual-Teacher distillation scheme. Extensive experiments on multiple benchmarks demonstrate that DSOD outperforms state-of-the-art SFOD methods, achieving 48.1% AP on Normal-to-Foggy weather adaptation, 39.3% AP on Cross-scene adaptation, and 61.4% AP on Synthetic-to-Real adaptation.}
 }
 ```
 
